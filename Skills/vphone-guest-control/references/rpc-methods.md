@@ -82,6 +82,9 @@ Names only; params come from `methods.list`. Prefer `ui.*` to coordinates.
   `current` fail with `location_services_off` while Location Services is off;
   `location.services` fails with `invalid_operation` if the switch did not change.
 - **Bootstrap:** `bootstrap.*`; flow in [guest-layout](guest-layout.md).
+- **Security:** `security.ca_install`, `security.ca_remove`, `security.ca_list`
+  (custom CA trust anchors in the guest TrustStore; `ca_install`/`ca_remove`
+  need `force:true`). Install/remove also from the host with `vphone-cli vm ca`.
 
 ## Installing an app
 

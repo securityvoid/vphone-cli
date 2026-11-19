@@ -239,6 +239,21 @@ extension GuestAPI {
             )
         case .securitySslKillswitch:
             return sslKillswitchStatus()
+        case .securityCaInstall:
+            let installed = try GuestTrustStore.install(
+                pem: string(params, "pem"), admin: bool(params, "admin", default: false))
+            return ["sha256": GuestTrustStore.hexString(installed.anchor.sha256),
+                    "subject": GuestTrustStore.subjectSummary(fromCertificateDER: installed.anchor.der),
+                    "domains": installed.domains.map(\.rawValue)]
+        case .securityCaRemove:
+            let removed = try GuestTrustStore.removeAnchor(sha256Hex: string(params, "sha256"))
+            return ["removed": true, "sha256": removed.sha256, "domains": removed.domains.map(\.rawValue)]
+        case .securityCaList:
+            return ["anchors": try GuestTrustStore.list().map {
+                ["sha256": GuestTrustStore.hexString($0.sha256),
+                 "subject": $0.subject,
+                 "domains": $0.domains.map(\.rawValue)]
+            }]
         case .diagnosticsSelfTest:
             return try runSelfTests()
         case .notifyPost:
