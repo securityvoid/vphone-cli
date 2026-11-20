@@ -1,140 +1,108 @@
 import CryptoKit
 import Darwin
 import Foundation
-import IcliKit
 import Security
-import SQLite3
 
-/// `int mbr_uid_to_uuid(uid_t id, uuid_t uu)` from `<membership.h>` (libSystem),
-/// which the Darwin module does not surface. Fills `uu` (16 bytes) with the
-/// uuid the membership subsystem maps the uid to; returns 0 on success.
-@_silgen_name("mbr_uid_to_uuid")
-private func mbr_uid_to_uuid(_ id: uid_t, _ uu: UnsafeMutablePointer<UInt8>) -> Int32
-
-/// `int gethostuuid(uuid_t id, const struct timespec *wait)` from libSystem.
-/// The SDK marks it unavailable for iOS, so the daemon's Mac Catalyst build
-/// cannot call Darwin's declaration, though libSystem exports it at runtime on
-/// macOS/Catalyst. Bind the symbol directly, as `mbr_uid_to_uuid` above does.
-@_silgen_name("gethostuuid")
-private func vp_gethostuuid(_ uu: UnsafeMutablePointer<UInt8>, _ wait: UnsafePointer<timespec>) -> Int32
-
-/// Reads and writes the guest TrustStore — the sqlite DB trustd consults for
-/// user-installed anchors at
-/// `/private/var/protected/trustd/private/TrustStore.sqlite3`.
+/// Installs, removes and lists a fully-trusted custom root anchor in the guest's
+/// **admin** trust domain through the Security.framework trust-store SPI, which
+/// drives trustd over its XPC interface. trustd performs the TrustStore write
+/// and keeps its own evaluation caches coherent, so there is NO direct DB
+/// access, no domain uuid computed, no store path hardcoded, and no trustd
+/// restart.
 ///
-/// The verified `tsettings` schema is
-/// `tsettings(sha256 BLOB NOT NULL, subj BLOB NOT NULL, tset BLOB, data BLOB, uuid BLOB NOT NULL, UNIQUE(sha256,uuid))`
-/// with `INDEX isubj ON tsettings(subj)`. An anchor row is written as a
-/// fully-trusted root (`tset` = NULL) so an intercepting proxy's certificates
-/// validate for every policy. trustd evaluates anchors by `subj` AND `uuid`
-/// (`SELECT data FROM tsettings WHERE subj=? AND uuid=?`), deriving the
-/// evaluation `uuid` from the calling process, so a row is honored only in its
-/// own trust domain. Two domains are supported: the **user** domain
-/// (`uuid = mbr_uid_to_uuid(501)`, mobile apps) and the **admin** domain
-/// (`uuid = gethostuuid()`, all uids incl. system daemons).
+/// Admin is the only supported domain: trust evaluation unions only the user and
+/// admin domains, and the user-domain uuid is keyed to the servicing trustd
+/// instance's own euid (not the caller's uid), so a root-written user-domain
+/// anchor is invisible to a per-user trustd; the admin domain is always
+/// consulted regardless of trustd euid, and vphoned runs as root, so the admin
+/// write always has privilege.
 ///
-/// trustd keeps the store cached in memory, so every change is followed by an
-/// in-process `kickstartService("com.apple.trustd", kill: true)`; `kill: false`
-/// would leave the stale cache in place.
+/// The four SPIs are `SecTrustSettingsPriv.h` SPI the iOS SDK does not vend, so
+/// they are resolved at runtime via `dlsym(RTLD_DEFAULT, …)` with
+/// `@convention(c)` signatures. The resolved calls are exposed through the
+/// injectable `SPI` seam so unit tests drive the logic without a live trustd.
 enum GuestTrustStore {
-    static let storePath = "/private/var/protected/trustd/private/TrustStore.sqlite3"
-    static let trustdLabel = "com.apple.trustd"
-    /// Bounded wait for a locked store; stays under the 30 s client RPC timeout.
-    static let busyTimeoutMilliseconds: Int32 = 5000
+    /// `kSecTrustStoreDomainAdmin` (1 = System, 2 = User, 3 = Admin).
+    static let adminDomain: Int32 = 3
     /// A CA PEM must be one certificate no larger than 64 KiB.
     static let maxPEMBytes = 64 * 1024
+    /// Serializes every `security.ca_*` trust-store sequence (pre-check, write,
+    /// verify, rollback) so concurrent RPC calls — the daemon's RPC queue is
+    /// `.concurrent` — never interleave and a cross-call rollback never deletes
+    /// a just-reported anchor. A NEW serial queue, not `GuestCryptex.queue`.
+    static let queue = DispatchQueue(label: "vphoned.trust-store")
 
-    /// A trust domain: which caller `uuid` honors the anchor. `admin` sorts
-    /// before `user` (the REQ-006 `domains` ordering is bytewise on the name).
-    enum Domain: String, CaseIterable {
-        case admin
-        case user
+    // MARK: - Injectable SPI seam
 
-        /// The 16-byte domain `uuid`, resolved live from the system providers.
-        static func liveUUID(_ domain: Domain) throws -> Data {
-            switch domain {
-            case .user: return try liveUserUUID()
-            case .admin: return try liveAdminUUID()
+    /// The four admin-domain trust-store SPI calls, wrapped so tests can inject
+    /// fakes. `forDomain` returns `nil` for a NULL store; `set` always installs
+    /// with nil trust settings (a default-trusted root); `copyAll` returns the
+    /// OSStatus and the `[[certDER, settings], …]` array (element 0 = full DER).
+    struct SPI {
+        let forDomain: (Int32) -> OpaquePointer?
+        let set: (OpaquePointer, SecCertificate) -> OSStatus
+        let remove: (OpaquePointer, SecCertificate) -> OSStatus
+        let copyAll: (OpaquePointer) -> (status: OSStatus, contents: CFArray?)
+    }
+
+    /// Resolve the four SPI symbols from `RTLD_DEFAULT`. Throws the
+    /// SPI-unavailable error naming the first symbol that does not resolve, so a
+    /// guest build that lacks the SPI fails every `security.ca_*` method before
+    /// any store change. Injectable (`resolveSPI`) so tests simulate the
+    /// unavailable path.
+    static func liveSPI() throws -> SPI {
+        typealias ForDomainC = @convention(c) (Int32) -> OpaquePointer?
+        typealias SetC = @convention(c) (OpaquePointer?, SecCertificate, CFTypeRef?) -> OSStatus
+        typealias RemoveC = @convention(c) (OpaquePointer?, SecCertificate) -> OSStatus
+        typealias CopyAllC = @convention(c) (OpaquePointer?, UnsafeMutablePointer<CFArray?>) -> OSStatus
+
+        // RTLD_DEFAULT is the pseudo-handle (void *)-2 on Darwin.
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        func symbol(_ name: String) throws -> UnsafeMutableRawPointer {
+            guard let pointer = dlsym(rtldDefault, name) else {
+                throw GuestAPIError.operationFailed(
+                    "The trust-store SPI \(name) could not be resolved via dlsym; this guest build does not export it.",
+                    hint: "Confirm the guest links Security.framework's trust-store SPI.")
             }
+            return pointer
         }
+        let forDomain = unsafeBitCast(try symbol("SecTrustStoreForDomain"), to: ForDomainC.self)
+        let set = unsafeBitCast(try symbol("SecTrustStoreSetTrustSettings"), to: SetC.self)
+        let remove = unsafeBitCast(try symbol("SecTrustStoreRemoveCertificate"), to: RemoveC.self)
+        let copyAll = unsafeBitCast(try symbol("SecTrustStoreCopyAll"), to: CopyAllC.self)
+        return SPI(
+            forDomain: { forDomain($0) },
+            set: { set($0, $1, nil) },
+            remove: { remove($0, $1) },
+            copyAll: { store in
+                var out: CFArray?
+                let status = copyAll(store, &out)
+                return (status, out)
+            })
     }
 
-    /// Resolves a domain's 16-byte `uuid`. Injectable so tests can force a
-    /// provider failure. A thrown error aborts the operation before any row
-    /// changes (REQ-007 provider-failure).
-    typealias UUIDProvider = (_ domain: Domain) throws -> Data
-    /// Resolves a certificate's normalized subject sequence (`subj`). Injectable
-    /// so tests can force the `SecCertificateCopyNormalizedSubjectSequence`
-    /// failure path.
-    typealias SubjectProvider = (_ certificate: SecCertificate) throws -> Data
-
-    /// user domain `uuid = mbr_uid_to_uuid(501)` (raw 16 bytes).
-    static func liveUserUUID() throws -> Data {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let rc = mbr_uid_to_uuid(501, &bytes)
-        guard rc == 0 else {
-            throw GuestAPIError.operationFailed(
-                "Resolving the user trust domain failed: mbr_uid_to_uuid(501) returned \(rc).")
-        }
-        return Data(bytes)
-    }
-
-    /// admin domain `uuid = gethostuuid()` (raw 16 bytes). The `wait` timespec
-    /// must be non-NULL; a zero wait returns the host uuid immediately.
-    static func liveAdminUUID() throws -> Data {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        var wait = timespec(tv_sec: 0, tv_nsec: 0)
-        let rc = vp_gethostuuid(&bytes, &wait)
-        guard rc == 0 else {
-            throw GuestAPIError.operationFailed(
-                "Resolving the admin trust domain failed: gethostuuid() returned \(rc) (errno \(errno)).")
-        }
-        return Data(bytes)
-    }
-
-    static func liveSubject(_ certificate: SecCertificate) throws -> Data {
-        guard let subject = SecCertificateCopyNormalizedSubjectSequence(certificate) as Data? else {
-            throw GuestAPIError.invalidRequest(
-                "The CA certificate has no readable subject.",
-                hint: "Pass a CA certificate with a subject name.")
-        }
-        return subject
-    }
-
-    /// How the store restarts trustd. Injectable so tests can assert the call
-    /// without touching launchd. Production restarts trustd in-process; a
-    /// thrown error becomes the install/remove failure (no row rollback).
-    typealias TrustdRestart = (_ label: String, _ kill: Bool) throws -> Void
-    static func liveRestart(_ label: String, _ kill: Bool) throws {
-        _ = try kickstartService(label, kill: kill)
-    }
-
-    /// A decoded anchor ready to write: full DER plus its derived TrustStore keys.
-    struct Anchor: Equatable {
-        /// Full certificate DER — the `data` column.
-        let der: Data
-        /// DER of the certificate's normalized subject — the `subj` column.
-        let subject: Data
-        /// SHA-256 of the full certificate DER — the `sha256` key (32 bytes).
-        let sha256: Data
-    }
+    typealias SPIProvider = () throws -> SPI
 
     // MARK: - Decoding
 
-    /// Decode a PEM certificate into its full DER and the derived `subj`/`sha256`
-    /// TrustStore keys. Throws `invalidRequest` when the PEM is not a single
-    /// parseable X.509 certificate; rethrows a `subject` provider failure.
-    static func anchor(fromPEM pem: String,
-                       subject subjectProvider: SubjectProvider = liveSubject) throws -> Anchor {
+    /// A decoded anchor ready to write: full DER and its SHA-256.
+    struct Anchor: Equatable {
+        /// Full certificate DER.
+        let der: Data
+        /// SHA-256 of the full certificate DER (32 bytes) — the `sha256` key.
+        let sha256: Data
+    }
+
+    /// Decode a PEM certificate into its full DER and SHA-256. Throws
+    /// `invalidRequest` when the PEM is not a single parseable X.509 certificate.
+    static func anchor(fromPEM pem: String) throws -> (anchor: Anchor, certificate: SecCertificate) {
         let der = try derFromPEM(pem)
         guard let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
             throw GuestAPIError.invalidRequest(
                 "The CA is not a valid DER X.509 certificate.",
                 hint: "Pass one PEM-encoded CA certificate.")
         }
-        let subject = try subjectProvider(certificate)
-        let sha256 = Data(SHA256.hash(data: der))
-        return Anchor(der: der, subject: subject, sha256: sha256)
+        return (Anchor(der: der, sha256: Data(SHA256.hash(data: der))), certificate)
     }
 
     /// Extract the single base64 DER body between the first PEM CERTIFICATE
@@ -158,237 +126,186 @@ enum GuestTrustStore {
         return der
     }
 
-    // MARK: - Store operations
+    // MARK: - Enumeration
 
-    /// Install an anchor: upsert one row per selected trust domain (user always,
-    /// admin additionally when `admin` is true) inside ONE `BEGIN IMMEDIATE`
-    /// transaction, then restart trustd. All selected-domain uuids and the
-    /// subject are resolved BEFORE any write, so a provider failure changes no
-    /// row and never restarts trustd. A per-domain INSERT failure rolls the
-    /// whole transaction back (zero rows for the sha256) and never restarts. A
-    /// restart failure after a committed write surfaces as the operation error
-    /// with the rows left in place (no rollback), so a retry after the restart
-    /// is fixed replaces the same rows and leaves exactly one per selected
-    /// domain. Returns the anchor and every domain the anchor is installed in
-    /// after the call (REQ-007 idempotency: pre-existing rows for unselected
-    /// domains are kept and reported).
+    /// Find the admin-domain certificate whose full DER has SHA-256 `sha256`, or
+    /// `nil` when none matches. Enumerates with `SecTrustStoreCopyAll`; a
+    /// non-zero status or a malformed element (not a 2-item `[certDER, settings]`
+    /// array, or an undecodable DER) throws naming `spiName`, never a crash or a
+    /// silent skip. Scans every element (no short-circuit) so a malformed row is
+    /// always surfaced.
+    static func findCertificate(sha256: Data,
+                                store: OpaquePointer,
+                                spi: SPI,
+                                spiName: String) throws -> SecCertificate? {
+        try enumerate(store, spi, spiName).last { Data(SHA256.hash(data: $0.der)) == sha256 }?.certificate
+    }
+
+    /// Decode every `SecTrustStoreCopyAll` element into its DER and certificate.
+    private static func enumerate(_ store: OpaquePointer,
+                                  _ spi: SPI,
+                                  _ spiName: String) throws -> [(der: Data, certificate: SecCertificate)] {
+        let (status, contents) = spi.copyAll(store)
+        guard status == errSecSuccess else {
+            throw GuestAPIError.operationFailed(
+                "\(spiName) failed (OSStatus \(status)) enumerating the admin trust store.")
+        }
+        guard let elements = contents as? [Any] else { return [] }
+        return try elements.map { element in
+            guard let pair = element as? [Any], pair.count == 2, let der = pair[0] as? Data else {
+                throw GuestAPIError.operationFailed(
+                    "\(spiName) returned a malformed element (not a 2-item [certificate, settings] array) "
+                        + "from the admin trust store.")
+            }
+            guard let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
+                throw GuestAPIError.operationFailed(
+                    "\(spiName) returned an element with an undecodable certificate DER from the admin trust store.")
+            }
+            return (der, certificate)
+        }
+    }
+
+    /// The admin-domain store; throws when the SPI returns NULL.
+    private static func adminStore(_ spi: SPI) throws -> OpaquePointer {
+        guard let store = spi.forDomain(adminDomain) else {
+            throw GuestAPIError.operationFailed(
+                "SecTrustStoreForDomain returned NULL for the admin domain; the admin trust store is unavailable.")
+        }
+        return store
+    }
+
+    private static func contains(sha256: Data, store: OpaquePointer, spi: SPI, spiName: String) throws -> Bool {
+        try findCertificate(sha256: sha256, store: store, spi: spi, spiName: spiName) != nil
+    }
+
+    // MARK: - Install
+
+    /// Install an anchor in the admin trust domain, all-or-none (REQ-007):
+    /// (0) a NULL store returns the SPI error before any other call;
+    /// (1) pre-check `SecTrustStoreCopyAll` for pre-presence (a failed/malformed
+    ///     pre-check errors before any write); (2) write
+    ///     `SecTrustStoreSetTrustSettings(cert, nil)`; (3) verify via a
+    ///     post-write `SecTrustStoreCopyAll`; (4) on any failure, if the cert was
+    ///     not pre-present, always `SecTrustStoreRemoveCertificate` (safe — it
+    ///     returns errSecSuccess when absent), leaving a pre-present cert intact;
+    ///     (5) if that undo itself fails, surface the undo-failure error.
+    /// Re-installing a cert that verifies present is success (idempotent). Runs
+    /// the whole sequence on the serial `queue`.
     @discardableResult
-    static func install(pem: String,
-                        admin: Bool,
-                        at path: String = storePath,
-                        restart: TrustdRestart = liveRestart,
-                        userUUID: UUIDProvider = Domain.liveUUID,
-                        subject: SubjectProvider = liveSubject) throws -> (anchor: Anchor, domains: [Domain]) {
-        try validate(pem: pem)
-        let anchor = try anchor(fromPEM: pem, subject: subject)
-        // Resolve BOTH domain uuids up front, before any write — a provider
-        // failure (incl. the admin provider on an admin:false install, needed
-        // to report `domains`) must change no row and never restart trustd.
-        let uuidToDomain = try domainUUIDMap(userUUID)
-        let selected: [Domain] = admin ? [.user, .admin] : [.user]
-        let rows = try selected.map { (domain: $0, uuid: try resolveUUID($0, userUUID)) }
-        let db = try open(path)
-        defer { sqlite3_close(db) }
-        try transaction(db) {
-            for row in rows {
-                try run(db,
-                        "INSERT OR REPLACE INTO tsettings (sha256, subj, tset, data, uuid) VALUES (?, ?, NULL, ?, ?)",
-                        blobs: [anchor.sha256, anchor.subject, anchor.der, row.uuid])
+    static func install(pem: String, resolveSPI: SPIProvider = liveSPI) throws -> Anchor {
+        try queue.sync {
+            try validate(pem: pem)
+            let (anchor, certificate) = try anchor(fromPEM: pem)
+            let spi = try resolveSPI()
+
+            // Step 0: a NULL store fails closed before any other trust-store call.
+            let store = try adminStore(spi)
+
+            // Step 1: pre-presence. A failed/malformed pre-check throws here,
+            // before any write (so spi.set is never reached in that case).
+            let prePresent = try contains(sha256: anchor.sha256, store: store, spi: spi, spiName: "SecTrustStoreCopyAll")
+
+            // Step 2: write.
+            let setStatus = spi.set(store, certificate)
+
+            // Steps 3–5. On any failure, roll back a cert this call added, then
+            // surface the original error (or the undo-failure error if the
+            // rollback itself fails). This unconditional undo is the one
+            // exception to the SPI-failure "make no further change" rule.
+            func finishFailure(_ original: GuestAPIError, setStatus: OSStatus) throws -> Never {
+                if !prePresent {
+                    let removeStatus = spi.remove(store, certificate)
+                    if removeStatus != errSecSuccess {
+                        throw GuestAPIError.operationFailed(
+                            "SecTrustStoreSetTrustSettings and SecTrustStoreRemoveCertificate both failed "
+                                + "(OSStatus \(setStatus) and \(removeStatus)); the anchor may still be installed "
+                                + "in the admin trust store. Check with security.ca_list and clean up with "
+                                + "security.ca_remove.")
+                    }
+                }
+                throw original
+            }
+
+            // Step 3: verify. A failed/malformed post-write enumeration routes
+            // through the rollback path naming SecTrustStoreCopyAll.
+            let present: Bool
+            do {
+                present = try contains(sha256: anchor.sha256, store: store, spi: spi, spiName: "SecTrustStoreCopyAll")
+            } catch let error as GuestAPIError {
+                try finishFailure(error, setStatus: setStatus)
+            }
+
+            if setStatus == errSecSuccess && present {
+                return anchor
+            }
+            if setStatus != errSecSuccess {
+                try finishFailure(
+                    GuestAPIError.operationFailed(
+                        "SecTrustStoreSetTrustSettings failed (OSStatus \(setStatus)); "
+                            + "the CA was not installed in the admin trust store."),
+                    setStatus: setStatus)
+            }
+            try finishFailure(
+                GuestAPIError.operationFailed(
+                    "SecTrustStoreSetTrustSettings returned success but SecTrustStoreCopyAll shows the CA was not "
+                        + "present in the admin trust store after the write; the install did not take effect."),
+                setStatus: setStatus)
+        }
+    }
+
+    // MARK: - Remove
+
+    /// Remove the admin-domain anchor with the given 64-char lowercase-hex
+    /// sha256, returning that normalized hex. A malformed value throws
+    /// `invalidRequest`; a sha256 with no installed row throws `notFound` and
+    /// calls no `SecTrustStoreRemoveCertificate`. After the remove, re-enumerates
+    /// and errors (never reports success) if the cert is still present. Runs on
+    /// the serial `queue`.
+    @discardableResult
+    static func removeAnchor(sha256Hex hex: String, resolveSPI: SPIProvider = liveSPI) throws -> String {
+        try queue.sync {
+            guard hex == hex.lowercased(), let sha256 = sha256(fromHex: hex) else {
+                throw GuestAPIError.invalidRequest(
+                    "sha256 must be 64 lowercase hex characters; got '\(hex)'.",
+                    hint: "Pass the sha256 shown by security.ca_list.")
+            }
+            let spi = try resolveSPI()
+            let store = try adminStore(spi)
+            guard let certificate = try findCertificate(sha256: sha256, store: store, spi: spi,
+                                                        spiName: "SecTrustStoreCopyAll") else {
+                throw GuestAPIError.notFound(
+                    "No installed CA has sha256 \(hex) in the admin trust store.",
+                    hint: "Run security.ca_list to see installed CAs.")
+            }
+            let removeStatus = spi.remove(store, certificate)
+            guard removeStatus == errSecSuccess else {
+                throw GuestAPIError.operationFailed(
+                    "SecTrustStoreRemoveCertificate failed (OSStatus \(removeStatus)) "
+                        + "removing the CA from the admin trust store.")
+            }
+            if try contains(sha256: sha256, store: store, spi: spi, spiName: "SecTrustStoreCopyAll") {
+                throw GuestAPIError.operationFailed(
+                    "SecTrustStoreRemoveCertificate reported success but SecTrustStoreCopyAll still shows the CA "
+                        + "in the admin trust store; the removal did not take effect.")
+            }
+            return hexString(sha256)
+        }
+    }
+
+    // MARK: - List
+
+    /// List every admin-domain anchor as its SHA-256 (full DER) and subject
+    /// summary. A non-zero status or malformed element throws naming
+    /// `SecTrustStoreCopyAll`. Returns rows in enumeration order; the host CLI
+    /// sorts. Runs on the serial `queue`.
+    static func list(resolveSPI: SPIProvider = liveSPI) throws -> [(sha256: Data, subject: String)] {
+        try queue.sync {
+            let spi = try resolveSPI()
+            let store = try adminStore(spi)
+            return try enumerate(store, spi, "SecTrustStoreCopyAll").map {
+                (Data(SHA256.hash(data: $0.der)), subjectSummary(fromCertificateDER: $0.der))
             }
         }
-        do { try restart(trustdLabel, true) } catch {
-            throw GuestAPIError.operationFailed(
-                "The anchor row(s) were written to \(path) but trustd (\(trustdLabel)) could not be restarted "
-                    + "(\(error)); the live trust store was not reloaded. "
-                    + "Retry the install (it is idempotent), restart trustd, or reboot the guest.")
-        }
-        return (anchor, try domains(forSHA256: anchor.sha256, uuidToDomain: uuidToDomain, db: db))
-    }
-
-    /// Remove every row whose `sha256` matches (all domains). Both domain uuids
-    /// are resolved BEFORE the DELETE (to report the domains removed and so a
-    /// provider failure leaves the rows intact). Restart trustd and return
-    /// `removed: true` with the domains the anchor had only when a row was
-    /// deleted; a non-matching `sha256` changes nothing, skips the restart, and
-    /// returns `removed: false`. A restart failure after a real delete surfaces
-    /// as the error (the rows are already gone — recover by restarting trustd,
-    /// not retrying).
-    @discardableResult
-    static func remove(sha256: Data,
-                       at path: String = storePath,
-                       restart: TrustdRestart = liveRestart,
-                       userUUID: UUIDProvider = Domain.liveUUID) throws -> (removed: Bool, domains: [Domain]) {
-        // Resolve BOTH providers first: a failure must leave the rows untouched.
-        let uuidToDomain = try domainUUIDMap(userUUID)
-        let db = try open(path)
-        defer { sqlite3_close(db) }
-        let present = try domains(forSHA256: sha256, uuidToDomain: uuidToDomain, db: db)
-        try run(db, "DELETE FROM tsettings WHERE sha256 = ?", blobs: [sha256])
-        guard sqlite3_changes(db) > 0 else { return (false, []) }
-        do { try restart(trustdLabel, true) } catch {
-            throw GuestAPIError.operationFailed(
-                "The anchor row(s) WERE removed from \(path) but trustd (\(trustdLabel)) could not be restarted "
-                    + "(\(error)); the live trust store was not reloaded. "
-                    + "Do not retry the remove: restart trustd "
-                    + "(kickstartService(\"\(trustdLabel)\", kill: true)) or reboot the guest.")
-        }
-        return (true, present)
-    }
-
-    /// Remove an anchor by its 64-char lowercase-hex sha256; returns that
-    /// normalized hex and the domains removed. A malformed value throws
-    /// `invalidRequest`; a sha256 with no installed row throws `notFound`.
-    static func removeAnchor(at path: String = storePath,
-                             sha256Hex hex: String,
-                             restart: TrustdRestart = liveRestart,
-                             userUUID: UUIDProvider = Domain.liveUUID) throws -> (sha256: String, domains: [Domain]) {
-        guard hex == hex.lowercased(), let sha256 = sha256(fromHex: hex) else {
-            throw GuestAPIError.invalidRequest(
-                "sha256 must be 64 lowercase hex characters; got '\(hex)'.",
-                hint: "Pass the sha256 shown by security.ca_list.")
-        }
-        let removed = try remove(sha256: sha256, at: path, restart: restart, userUUID: userUUID)
-        guard removed.removed else {
-            throw GuestAPIError.notFound(
-                "No installed CA has sha256 \(hex).",
-                hint: "Run security.ca_list to see installed CAs.")
-        }
-        return (hexString(sha256), removed.domains)
-    }
-
-    /// List every user-installed anchor — rows whose `uuid` is a supported
-    /// domain — as its lowercase-hex `sha256` key, subject summary (from
-    /// `SecCertificateCopySubjectSummary` on the stored certificate), and the
-    /// domains it is installed in. One entry per distinct `sha256`, its
-    /// `domains` aggregating its rows. Both domain uuids are resolved first.
-    static func list(at path: String = storePath,
-                     userUUID: UUIDProvider = Domain.liveUUID)
-        throws -> [(sha256: Data, subject: String, domains: [Domain])] {
-        // Resolve BOTH providers first: a failure must surface before any read.
-        let uuidToDomain = try domainUUIDMap(userUUID)
-        let db = try open(path)
-        defer { sqlite3_close(db) }
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT sha256, data, uuid FROM tsettings", -1, &statement, nil) == SQLITE_OK
-        else { throw storeError(db) }
-        defer { sqlite3_finalize(statement) }
-        // Preserve first-seen DER per sha256; accumulate domains.
-        var order: [Data] = []
-        var ders: [Data: Data] = [:]
-        var domainsBySHA: [Data: Set<Domain>] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let sha256 = blob(statement, 0)
-            let der = blob(statement, 1)
-            let uuid = blob(statement, 2)
-            guard let domain = uuidToDomain[uuid] else { continue }
-            if ders[sha256] == nil { ders[sha256] = der; order.append(sha256) }
-            domainsBySHA[sha256, default: []].insert(domain)
-        }
-        return order.map { sha in
-            (sha, subjectSummary(fromCertificateDER: ders[sha] ?? Data()), sorted(domainsBySHA[sha] ?? []))
-        }
-    }
-
-    /// The domains an anchor currently occupies, from the live rows for `sha256`.
-    private static func domains(forSHA256 sha256: Data,
-                                uuidToDomain: [Data: Domain],
-                                db: OpaquePointer) throws -> [Domain] {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT uuid FROM tsettings WHERE sha256 = ?", -1, &statement, nil) == SQLITE_OK
-        else { throw storeError(db) }
-        defer { sqlite3_finalize(statement) }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        _ = sha256.withUnsafeBytes { raw in
-            sqlite3_bind_blob(statement, 1, raw.baseAddress, Int32(sha256.count), transient)
-        }
-        var found: Set<Domain> = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if let domain = uuidToDomain[blob(statement, 0)] { found.insert(domain) }
-        }
-        return sorted(found)
-    }
-
-    /// Resolve both domain uuids once and map uuid bytes → domain. Resolving
-    /// both is required on every CA call because computing an anchor's `domains`
-    /// needs both; a provider failure throws here before any row changes.
-    private static func domainUUIDMap(_ userUUID: UUIDProvider) throws -> [Data: Domain] {
-        var map: [Data: Domain] = [:]
-        for domain in Domain.allCases { map[try resolveUUID(domain, userUUID)] = domain }
-        return map
-    }
-
-    /// One domain's `uuid`; an empty blob is a provider failure, never written or matched.
-    private static func resolveUUID(_ domain: Domain, _ provider: UUIDProvider) throws -> Data {
-        let uuid = try provider(domain)
-        guard !uuid.isEmpty else {
-            throw GuestAPIError.operationFailed(
-                "Resolving the \(domain.rawValue) trust domain returned an empty uuid.")
-        }
-        return uuid
-    }
-
-    private static func sorted(_ domains: Set<Domain>) -> [Domain] {
-        domains.sorted { $0.rawValue < $1.rawValue }
-    }
-
-    // MARK: - SQLite
-
-    private static func open(_ path: String) throws -> OpaquePointer {
-        var handle: OpaquePointer?
-        let rc = sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil)
-        guard rc == SQLITE_OK, let db = handle else {
-            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "cannot open database"
-            sqlite3_close(handle)
-            throw GuestAPIError.operationFailed(
-                "The guest TrustStore \(path) could not be opened: \(message).",
-                hint: "Confirm the CFW guest exposes \(storePath).")
-        }
-        sqlite3_busy_timeout(db, busyTimeoutMilliseconds)
-        return db
-    }
-
-    /// Run `body` inside a `BEGIN IMMEDIATE` … `COMMIT` transaction; any thrown
-    /// error triggers a `ROLLBACK` (leaving zero rows) and is rethrown.
-    private static func transaction(_ db: OpaquePointer, _ body: () throws -> Void) throws {
-        try exec(db, "BEGIN IMMEDIATE")
-        do {
-            try body()
-            try exec(db, "COMMIT")
-        } catch {
-            _ = try? exec(db, "ROLLBACK")
-            throw error
-        }
-    }
-
-    private static func exec(_ db: OpaquePointer, _ sql: String) throws {
-        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw storeError(db) }
-    }
-
-    private static func run(_ db: OpaquePointer, _ sql: String, blobs: [Data]) throws {
-        // sqlite must copy each bound blob — the backing Data is transient.
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw storeError(db) }
-        defer { sqlite3_finalize(statement) }
-        for (offset, blob) in blobs.enumerated() {
-            let index = Int32(offset + 1)
-            let rc = blob.withUnsafeBytes { raw in
-                sqlite3_bind_blob(statement, index, raw.baseAddress, Int32(blob.count), transient)
-            }
-            guard rc == SQLITE_OK else { throw storeError(db) }
-        }
-        guard sqlite3_step(statement) == SQLITE_DONE else { throw storeError(db) }
-    }
-
-    private static func blob(_ statement: OpaquePointer?, _ column: Int32) -> Data {
-        guard let pointer = sqlite3_column_blob(statement, column) else { return Data() }
-        return Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement, column)))
-    }
-
-    private static func storeError(_ db: OpaquePointer) -> GuestAPIError {
-        let path = sqlite3_db_filename(db, "main").map { String(cString: $0) } ?? storePath
-        return GuestAPIError.operationFailed(
-            "The guest TrustStore \(path) operation failed: \(String(cString: sqlite3_errmsg(db))).")
     }
 
     // MARK: - Input validation

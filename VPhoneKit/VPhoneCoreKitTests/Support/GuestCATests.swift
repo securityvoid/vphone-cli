@@ -9,9 +9,10 @@ import Testing
 /// rejects open no socket and raise `UsageError`; a tiny in-test Unix-socket
 /// stub (the one-line request / one-line JSON reply protocol
 /// `VPhoneHostAutomationProbe.send` speaks) drives the install/remove/list
-/// transport, reply validation, and stdout formatting. The verified guest
-/// schema (sha256/uuid/domains) surfaces here as the sha256 identifier, the
-/// `--admin` flag, and the user/admin `domains` on every reply.
+/// transport, reply validation, and stdout formatting. The guest installs into
+/// the admin trust domain only, so there is no `--admin` flag and no `domains`
+/// field: install/remove replies carry just `sha256` (+ `subject`/`removed`),
+/// and `ca list` renders `sha256 TAB subject`.
 struct GuestCATests {
     // MARK: Helpers
 
@@ -117,7 +118,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         #expect {
             try VPhoneGuestCA.install(
-                vmName: "vm", library: fixture.library, pemPath: "/nope.pem", admin: false, rpc: forbiddenRPC,
+                vmName: "vm", library: fixture.library, pemPath: "/nope.pem", rpc: forbiddenRPC,
             )
         } throws: { ($0 as? VPhoneGuestCA.UsageError)?.description.contains("/nope.pem") == true }
     }
@@ -144,7 +145,7 @@ struct GuestCATests {
         let pem = try writePEM(validPEM() + filler)
         #expect(try Data(contentsOf: URL(fileURLWithPath: pem)).count == VPhoneGuestCA.maximumPEMBytes + 1)
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: forbiddenRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: forbiddenRPC)
         } throws: { ($0 as? VPhoneGuestCA.UsageError)?.description.contains("64 KiB") == true }
     }
 
@@ -152,7 +153,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let pem = try writePEM("not a certificate at all\n")
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: forbiddenRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: forbiddenRPC)
         } throws: { ($0 as? VPhoneGuestCA.UsageError)?.description.contains("no certificate") == true }
     }
 
@@ -160,7 +161,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let pem = try writePEM(validPEM(certificates: 2))
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: forbiddenRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: forbiddenRPC)
         } throws: { ($0 as? VPhoneGuestCA.UsageError)?.description.contains("holds 2 certificates") == true }
     }
 
@@ -168,7 +169,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let pem = try writePEM("-----BEGIN CERTIFICATE-----\nMIIBfake==\n")
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: forbiddenRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: forbiddenRPC)
         } throws: { ($0 as? VPhoneGuestCA.UsageError)?.description.contains("no matching") == true }
     }
 
@@ -178,23 +179,23 @@ struct GuestCATests {
         let fixture = try makeLibrary() // no stub bound at the socket path
         let pem = try writePEM(validPEM())
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: forbiddenRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: forbiddenRPC)
         } throws: { ($0 as? VPhoneGuestCA.RuntimeError)?.description.contains("vm launch") == true }
     }
 
     // MARK: Stub-driven transport
 
-    @Test func `install sends ca_install with the cert block, admin and force true`() throws {
+    @Test func `install sends ca_install with the cert block and force true`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domains": ["user"]]],
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
         )
         defer { server.stop() }
         let pemText = validPEM()
         let pem = try writePEM(pemText)
 
-        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: controlSocketRPC)
+        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: controlSocketRPC)
 
         let request = try #require(server.lastRequest())
         #expect(request["method"] as? String == "security.ca_install")
@@ -202,37 +203,22 @@ struct GuestCATests {
         let sent = try #require(params["pem"] as? String)
         #expect(sent.contains("-----BEGIN CERTIFICATE-----") && sent.contains("-----END CERTIFICATE-----"))
         #expect(sent.contains("MIIBfakebase64=="))
-        #expect(params["admin"] as? Bool == false)
+        #expect(params["admin"] == nil, "no admin param is sent: the guest installs admin-domain only")
         #expect(params["force"] as? Bool == true)
-    }
-
-    @Test func `install with --admin forwards admin true`() throws {
-        let fixture = try makeLibrary()
-        let server = try StubSocketServer(
-            path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domains": ["admin", "user"]]],
-        )
-        defer { server.stop() }
-        let pem = try writePEM(validPEM())
-
-        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: true, rpc: controlSocketRPC)
-
-        let request = try #require(server.lastRequest())
-        #expect((request["params"] as? [String: Any])?["admin"] as? Bool == true)
     }
 
     @Test func `install sends only the CERTIFICATE block, never a bundled PRIVATE KEY`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domains": ["user"]]],
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
         )
         defer { server.stop() }
         let combined = "-----BEGIN PRIVATE KEY-----\nSECRETKEYMATERIAL==\n-----END PRIVATE KEY-----\n"
             + "-----BEGIN CERTIFICATE-----\nMIIBcert==\n-----END CERTIFICATE-----\n"
         let pem = try writePEM(combined)
 
-        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: controlSocketRPC)
+        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: controlSocketRPC)
 
         let sent = try #require((server.lastRequest()?["params"] as? [String: Any])?["pem"] as? String)
         #expect(sent.contains("BEGIN CERTIFICATE"))
@@ -244,7 +230,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["removed": true, "sha256": sha256A, "domains": ["user"]]],
+            reply: ["ok": true, "result": ["removed": true, "sha256": sha256A]],
         )
         defer { server.stop() }
         let upper = String(repeating: "AB", count: 32) // 64 hex, uppercase
@@ -270,29 +256,28 @@ struct GuestCATests {
         #expect((request["params"] as? [String: Any])?.isEmpty == true)
     }
 
-    @Test func `list renders sha256 TAB domains TAB subject per anchor`() throws {
+    @Test func `list renders sha256 TAB subject per anchor`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": "Acme Root CA", "domains": ["admin", "user"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": "Acme Root CA"]]]],
         )
         defer { server.stop() }
 
         let output = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
-        #expect(output == "\(sha256A)\tadmin,user\tAcme Root CA\n")
+        #expect(output == "\(sha256A)\tAcme Root CA\n")
     }
 
-    @Test func `list sorts domains and renders an empty subject`() throws {
+    @Test func `list renders an empty subject`() throws {
         let fixture = try makeLibrary()
-        // Guest delivers domains out of order; host sorts admin < user.
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["sha256": sha256B, "subject": "", "domains": ["user", "admin"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["sha256": sha256B, "subject": ""]]]],
         )
         defer { server.stop() }
 
         let output = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
-        #expect(output == "\(sha256B)\tadmin,user\t\n")
+        #expect(output == "\(sha256B)\t\n")
     }
 
     @Test func `list sorts anchors bytewise on the lowercase hex sha256`() throws {
@@ -300,25 +285,25 @@ struct GuestCATests {
         let high = String(repeating: "f", count: 64)
         let low = String(repeating: "0", count: 64)
         let server = try StubSocketServer(path: fixture.socketPath, reply: ["ok": true, "result": ["anchors": [
-            ["sha256": high, "subject": "high", "domains": ["user"]],
-            ["sha256": low, "subject": "low", "domains": ["user"]],
+            ["sha256": high, "subject": "high"],
+            ["sha256": low, "subject": "low"],
         ]]])
         defer { server.stop() }
 
         let output = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
-        #expect(output == "\(low)\tuser\tlow\n\(high)\tuser\thigh\n")
+        #expect(output == "\(low)\tlow\n\(high)\thigh\n")
     }
 
     @Test func `list host-sanitizes control characters in the subject`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": "a\tb\u{7f}c", "domains": ["user"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": "a\tb\u{7f}c"]]]],
         )
         defer { server.stop() }
 
         let output = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
-        #expect(output == "\(sha256A)\tuser\ta b c\n", "TAB and DEL in the subject each become a space")
+        #expect(output == "\(sha256A)\ta b c\n", "TAB and DEL in the subject each become a space")
     }
 
     @Test func `list with empty anchors is empty stdout`() throws {
@@ -345,7 +330,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["subject": "x", "domains": ["user"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["subject": "x"]]]],
         )
         defer { server.stop() }
         #expect(throws: VPhoneGuestCA.RuntimeError.self) {
@@ -357,7 +342,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["sha256": String(repeating: "z", count: 64), "subject": "x", "domains": ["user"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["sha256": String(repeating: "z", count: 64), "subject": "x"]]]],
         )
         defer { server.stop() }
         #expect(throws: VPhoneGuestCA.RuntimeError.self) {
@@ -365,30 +350,42 @@ struct GuestCATests {
         }
     }
 
-    @Test func `a row with an unknown domain is malformed`() throws {
+    @Test func `a row missing subject is malformed`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": "x", "domains": ["root"]]]]],
+            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A]]]],
         )
         defer { server.stop() }
-        #expect(throws: VPhoneGuestCA.RuntimeError.self) {
+        #expect {
             _ = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
-        }
+        } throws: { ($0 as? VPhoneGuestCA.RuntimeError)?.description.contains("malformed security.ca_list reply") == true }
+    }
+
+    @Test func `a row with a non-string subject is malformed`() throws {
+        let fixture = try makeLibrary()
+        let server = try StubSocketServer(
+            path: fixture.socketPath,
+            reply: ["ok": true, "result": ["anchors": [["sha256": sha256A, "subject": 5]]]],
+        )
+        defer { server.stop() }
+        #expect {
+            _ = try VPhoneGuestCA.list(vmName: "vm", library: fixture.library, rpc: controlSocketRPC)
+        } throws: { ($0 as? VPhoneGuestCA.RuntimeError)?.description.contains("malformed security.ca_list reply") == true }
     }
 
     // MARK: Malformed ca_install / ca_remove replies (exit 1)
 
-    @Test func `an install reply missing domains is malformed`() throws {
+    @Test func `an install reply missing subject is malformed`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
+            reply: ["ok": true, "result": ["sha256": sha256A]],
         )
         defer { server.stop() }
         let pem = try writePEM(validPEM())
         #expect(throws: VPhoneGuestCA.RuntimeError.self) {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, rpc: controlSocketRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: controlSocketRPC)
         }
     }
 
@@ -396,7 +393,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["removed": false, "sha256": sha256A, "domains": ["user"]]],
+            reply: ["ok": true, "result": ["removed": false, "sha256": sha256A]],
         )
         defer { server.stop() }
         #expect(throws: VPhoneGuestCA.RuntimeError.self) {
@@ -407,9 +404,8 @@ struct GuestCATests {
     // MARK: Success + refusal replies
 
     @Test(arguments: [
-        #"{"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","subject":"x","domains":["user"]}"#,
-        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":5,"domains":["user"]}"#,
-        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":"x","domains":["root"]}"#,
+        #"{"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","subject":"x"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":5}"#,
     ])
     func `an install reply with a bad field is malformed`(json: String) throws {
         let reply = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
@@ -419,8 +415,10 @@ struct GuestCATests {
     }
 
     @Test(arguments: [
-        #"{"removed":true,"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","domains":["user"]}"#,
-        #"{"removed":true,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        #"{"removed":true,"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#,
+        #"{"removed":false,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        #"{"removed":"true","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
     ])
     func `a remove reply with a bad field is malformed`(json: String) throws {
         let reply = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
@@ -429,14 +427,8 @@ struct GuestCATests {
         } throws: { ($0 as? VPhoneGuestCA.RuntimeError)?.description.contains("malformed security.ca_remove reply") == true }
     }
 
-    @Test(arguments: [
-        "anchor not found: \(String(repeating: "a", count: 64)); check with ca list",
-        "anchor written but trustd was not restarted; retry (install is idempotent) or restart trustd",
-        "anchor removed but trustd was not restarted; restart trustd or reboot the guest, do not retry",
-        "TrustStore DB missing at /private/var/protected/trustd/private/TrustStore.sqlite3",
-        "TrustStore DB busy (SQLITE_BUSY) at /private/var/protected/trustd/private/TrustStore.sqlite3",
-    ])
-    func `a refusal surfaces the guest message as a runtime error`(message: String) throws {
+    @Test func `a refusal surfaces the guest message as a runtime error`() throws {
+        let message = "anchor not found: \(String(repeating: "a", count: 64)); check with ca list"
         let fixture = try makeLibrary()
         let server = try StubSocketServer(path: fixture.socketPath, reply: ["ok": false, "error": message, "guest_error": ["message": message, "code": "ca_error"]])
         defer { server.stop() }
@@ -453,14 +445,14 @@ struct GuestCATests {
         defer { server.stop() }
         let pem = try writePEM(validPEM())
         #expect {
-            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: false, timeout: 1, rpc: controlSocketRPC)
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, timeout: 1, rpc: controlSocketRPC)
         } throws: {
             let text = ($0 as? VPhoneGuestCA.RuntimeError)?.description ?? ""
             return text.contains("timed out") && text.contains("unknown") && text.contains("ca list")
         }
     }
 
-    @Test func `remove timeout points at ca list and trustd recovery`() throws {
+    @Test func `remove timeout points at ca list`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(path: fixture.socketPath, reply: nil)
         defer { server.stop() }
@@ -468,7 +460,7 @@ struct GuestCATests {
             try VPhoneGuestCA.remove(vmName: "vm", library: fixture.library, sha256: String(repeating: "a", count: 64), timeout: 1, rpc: controlSocketRPC)
         } throws: {
             let text = ($0 as? VPhoneGuestCA.RuntimeError)?.description ?? ""
-            return text.contains("timed out") && text.contains("unknown") && text.contains("ca list") && text.contains("trustd")
+            return text.contains("timed out") && text.contains("unknown") && text.contains("ca list")
         }
     }
 }

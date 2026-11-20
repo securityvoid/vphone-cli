@@ -248,17 +248,16 @@ enum DeviceMethod: String, GuestMethod {
         case .securitySslKillswitch: MethodSpec(summary: "Report whether the SSL killswitch is present", result: [.required("present", .boolean)])
         case .securityCaInstall:
             MethodSpec(.required("pem", .string, "PEM-encoded CA certificate; one certificate, at most 64 KiB"),
-                       .optional("admin", .boolean, "Also trust the CA in the admin domain (gethostuuid); default user domain only", default: false),
-                       summary: "Install a CA as a fully-trusted root anchor in the guest TrustStore and restart trustd",
+                       summary: "Install a CA as a fully-trusted root anchor in the guest admin trust domain",
                        force: .always("install a trusted root CA in the guest"),
-                       result: [.required("sha256", .string), .required("subject", .string), .required("domains", .array)])
+                       result: [.required("sha256", .string), .required("subject", .string)])
         case .securityCaRemove:
             MethodSpec(.required("sha256", .string, "64-character hex SHA-256 of the certificate DER, as shown by security.ca_list"),
-                       summary: "Remove a trusted root CA from the guest TrustStore by sha256 (all domains) and restart trustd",
+                       summary: "Remove a trusted root CA from the guest admin trust domain by sha256",
                        force: .always("remove a trusted root CA from the guest"),
-                       result: [.required("removed", .boolean), .required("sha256", .string), .required("domains", .array)])
+                       result: [.required("removed", .boolean), .required("sha256", .string)])
         case .securityCaList:
-            MethodSpec(summary: "List user-installed trusted root CAs as sha256, subject summary (control chars as spaces) and trust domains", result: [.required("anchors", .array)])
+            MethodSpec(summary: "List trusted root CAs in the guest admin trust domain as sha256 and subject summary (control chars as spaces)", result: [.required("anchors", .array)])
         case .diagnosticsSelfTest: MethodSpec(summary: "Run the guest's built-in self tests and report passed, failed and skipped", result: [.required("complete", .boolean),
                                                        .required("environment", .object),
                                                        .required("failed", .integer),

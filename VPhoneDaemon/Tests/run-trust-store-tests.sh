@@ -2,13 +2,14 @@
 set -euo pipefail
 
 # Builds the guest-independent GuestTrustStore logic with TrustStoreTests.swift
-# for the Mac and runs them: install/remove/list against a temp sqlite file with
-# an injected restart closure (restart- and DB-failure errors), the REQ-006
-# input rejects, and the SecCertificateCopySubjectSummary subject rendering with
-# its control-char sanitization. GuestTrustStore imports IcliKit only for
-# kickstartService, which the injected restart never reaches, so a one-line
-# stub module stands in. A fixture CA (CN=Test CA) is generated with openssl and
-# passed as argv[1]. No guest is needed.
+# for the Mac and runs them: the admin-domain install/remove/list flow driven
+# through injected GuestTrustStore.SPI fakes (the all-or-none install flow and
+# its rollback, the SPI-failure / malformed-CopyAll / SPI-unavailable /
+# NULL-store paths, and the serial-queue serialization), the REQ-006 input
+# rejects, and the SecCertificateCopySubjectSummary subject rendering with its
+# control-char sanitization. No live trustd and no guest are needed. A fixture CA
+# (CN=Test CA) is generated with openssl and passed as argv[1] for the subject
+# and sha256 assertions.
 
 daemon="${0:a:h:h}"
 temporary="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/vphone-trust-store-tests.XXXXXX")"
@@ -16,22 +17,14 @@ trap '/bin/rm -rf "$temporary"' EXIT
 
 compiler=("${SWIFTC:-swiftc}")
 [[ -x /usr/bin/xcrun ]] && compiler=(/usr/bin/xcrun --sdk macosx swiftc)
-extension=so
-[[ $(uname -s) == Darwin ]] && extension=dylib
 
-print -r -- 'import Foundation
-public func kickstartService(_ label: String, kill: Bool) throws -> [String: Any] { [:] }' \
-    > "$temporary/IcliKit.swift"
+flags=(-swift-version 6 -module-cache-path "$temporary/modules")
 
-flags=(-swift-version 6 -module-cache-path "$temporary/modules" -I "$temporary" -L "$temporary")
-
-"${compiler[@]}" "${flags[@]}" -emit-library -emit-module -module-name IcliKit \
-    "$temporary/IcliKit.swift" -o "$temporary/libIcliKit.$extension"
-
-"${compiler[@]}" "${flags[@]}" -parse-as-library -lIcliKit -Xlinker -rpath -Xlinker "$temporary" \
+"${compiler[@]}" "${flags[@]}" -parse-as-library \
     "$daemon/Daemon/GuestMethodSpec.swift" \
     "$daemon/Daemon/GuestPaging.swift" \
     "$daemon/Daemon/GuestTrustStore.swift" \
+    "$daemon/Daemon/GuestSecurityCADispatch.swift" \
     "$daemon/Tests/TrustStoreTests.swift" \
     -o "$temporary/trust-store-tests"
 

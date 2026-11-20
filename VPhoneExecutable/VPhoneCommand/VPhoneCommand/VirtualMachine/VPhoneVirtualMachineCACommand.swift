@@ -4,7 +4,7 @@ import VPhoneCoreKit
 
 // MARK: - ca
 
-/// Install, remove, and list the guest's user-trusted custom CA anchors by
+/// Install, remove, and list the guest's trusted custom CA anchors (admin trust domain) by
 /// driving the `security.ca_*` RPCs over the target VM's control socket
 /// (`vphone.sock`), exactly as `vm network` reaches a running VM. The VM is a
 /// positional name; there is no HTTP API, base URL, or token.
@@ -47,14 +47,12 @@ struct VPhoneVirtualMachineCACommand: ParsableCommand {
         @OptionGroup var lib: VPhoneLibraryOption
         @Argument(help: "VM name") var name: String?
         @Argument(help: "PEM file with exactly one certificate") var pemFile: String
-        @Flag(name: .long, help: "Also trust the CA in the admin domain (all uids), not just the user domain")
-        var admin = false
 
         func run() throws {
             let name = try VPhoneVirtualMachineSelection.resolveExisting(name, in: lib.library)
             try VPhoneVirtualMachineCACommand.dispatch {
                 try VPhoneGuestCA.install(
-                    vmName: name, library: lib.library, pemPath: pemFile, admin: admin,
+                    vmName: name, library: lib.library, pemPath: pemFile,
                     rpc: VPhoneHostAutomationProbe.rpc,
                 )
             }
@@ -89,7 +87,7 @@ struct VPhoneVirtualMachineCACommand: ParsableCommand {
     struct List: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "list",
-            abstract: "List the guest's user-installed CA anchors (sha256 TAB domains TAB subject)",
+            abstract: "List the guest's installed CA anchors (sha256 TAB subject)",
         )
 
         @OptionGroup var lib: VPhoneLibraryOption

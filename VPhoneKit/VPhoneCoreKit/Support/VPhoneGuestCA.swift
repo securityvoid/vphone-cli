@@ -45,15 +45,14 @@ public enum VPhoneGuestCA {
 
     // MARK: - Public operations
 
-    /// `vm ca install <vmname> <pem-file> [--admin]`: read + validate the PEM
-    /// host-side, extract only the single CERTIFICATE block, then
-    /// `security.ca_install {pem, admin, force: true}`. Validates the reply.
-    /// Writes nothing on success.
+    /// `vm ca install <vmname> <pem-file>`: read + validate the PEM host-side,
+    /// extract only the single CERTIFICATE block, then
+    /// `security.ca_install {pem, force: true}` (admin trust domain). Validates
+    /// the reply. Writes nothing on success.
     public static func install(
         vmName: String,
         library: VPhoneLibrary,
         pemPath: String,
-        admin: Bool,
         timeout: Int = timeoutSeconds,
         rpc: RPC,
     ) throws {
@@ -61,7 +60,7 @@ public enum VPhoneGuestCA {
         let pem = try loadInstallPEM(path: pemPath)
         let reply = try call(
             method: "security.ca_install",
-            params: ["pem": pem, "admin": admin, "force": true],
+            params: ["pem": pem, "force": true],
             socketPath: socketPath, vmName: vmName, timeout: timeout, rpc: rpc,
             timeoutTail: "",
         )
@@ -84,7 +83,7 @@ public enum VPhoneGuestCA {
             method: "security.ca_remove",
             params: ["sha256": normalized, "force": true],
             socketPath: socketPath, vmName: vmName, timeout: timeout, rpc: rpc,
-            timeoutTail: " If the anchor is now absent, restart trustd or reboot the guest.",
+            timeoutTail: "",
         )
         try validateRemoveReply(reply)
     }
@@ -159,29 +158,25 @@ public enum VPhoneGuestCA {
     // MARK: - Reply validation + formatting
 
     /// Validate a `security.ca_install` reply: 64-hex `sha256`, string
-    /// `subject`, `domains` array of `user`/`admin`. Any violation is a
-    /// malformed-reply error (exit 1).
+    /// `subject`. Any violation is a malformed-reply error (exit 1).
     static func validateInstallReply(_ reply: [String: Any]) throws {
         guard let sha256 = reply["sha256"] as? String, isSHA256Hex(sha256),
-              reply["subject"] is String,
-              let domains = reply["domains"] as? [Any], isDomainList(domains)
+              reply["subject"] is String
         else {
             throw RuntimeError(
-                "malformed security.ca_install reply: expected {sha256: 64-hex, subject: string, domains: [user|admin]}",
+                "malformed security.ca_install reply: expected {sha256: 64-hex, subject: string}",
             )
         }
     }
 
     /// Validate a `security.ca_remove` reply: `removed` exactly `true`, 64-hex
-    /// `sha256`, `domains` array of `user`/`admin`. Any violation is a
-    /// malformed-reply error (exit 1).
+    /// `sha256`. Any violation is a malformed-reply error (exit 1).
     static func validateRemoveReply(_ reply: [String: Any]) throws {
         guard (reply["removed"] as? Bool) == true,
-              let sha256 = reply["sha256"] as? String, isSHA256Hex(sha256),
-              let domains = reply["domains"] as? [Any], isDomainList(domains)
+              let sha256 = reply["sha256"] as? String, isSHA256Hex(sha256)
         else {
             throw RuntimeError(
-                "malformed security.ca_remove reply: expected {removed: true, sha256: 64-hex, domains: [user|admin]}",
+                "malformed security.ca_remove reply: expected {removed: true, sha256: 64-hex}",
             )
         }
     }
@@ -194,17 +189,15 @@ public enum VPhoneGuestCA {
         guard let anchors = result["anchors"] as? [Any] else {
             throw RuntimeError(#"malformed security.ca_list reply: missing "anchors" array"#)
         }
-        var rows: [(sha256: String, domains: String, subject: String)] = []
+        var rows: [(sha256: String, subject: String)] = []
         for element in anchors {
             guard
                 let anchor = element as? [String: Any],
                 let rawSHA256 = anchor["sha256"] as? String,
-                let subject = anchor["subject"] as? String,
-                let domains = anchor["domains"] as? [Any], isDomainList(domains)
+                let subject = anchor["subject"] as? String
             else {
                 throw RuntimeError(
-                    "malformed security.ca_list reply: an anchor is missing a 64-hex sha256, string subject, "
-                        + "or user/admin domains array",
+                    "malformed security.ca_list reply: an anchor is missing a 64-hex sha256 or string subject",
                 )
             }
             let hex = rawSHA256.lowercased()
@@ -213,14 +206,13 @@ public enum VPhoneGuestCA {
                     "malformed security.ca_list reply: sha256 is not 64 hex characters",
                 )
             }
-            let names = domains.compactMap { $0 as? String }.sorted().joined(separator: ",")
-            rows.append((hex, names, sanitize(subject)))
+            rows.append((hex, sanitize(subject)))
         }
         // Host sorts bytewise on the lowercase-hex sha256, independent of the
         // order the guest returned.
         rows.sort { $0.sha256.utf8.lexicographicallyPrecedes($1.sha256.utf8) }
         guard !rows.isEmpty else { return "" }
-        return rows.map { "\($0.sha256)\t\($0.domains)\t\($0.subject)" }.joined(separator: "\n") + "\n"
+        return rows.map { "\($0.sha256)\t\($0.subject)" }.joined(separator: "\n") + "\n"
     }
 
     // MARK: - Transport
@@ -279,12 +271,6 @@ public enum VPhoneGuestCA {
 
     private static func isSHA256Hex(_ s: String) -> Bool {
         s.count == 64 && isLowercaseHex(s.lowercased())
-    }
-
-    /// A `domains` value: a non-empty array whose every element is the string
-    /// `user` or `admin`.
-    private static func isDomainList(_ domains: [Any]) -> Bool {
-        !domains.isEmpty && domains.allSatisfy { ($0 as? String).map { $0 == "user" || $0 == "admin" } ?? false }
     }
 
     /// Replace every C0 control char (0x00–0x1F) or DEL (0x7F) with a single
