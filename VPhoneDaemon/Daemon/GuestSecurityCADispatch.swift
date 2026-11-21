@@ -10,13 +10,17 @@ import Foundation
 /// behaviour, all-or-none rules and input rejects live there (REQ-007/008);
 /// this layer only owns the RPC param keys and the reply field names (REQ-006).
 enum GuestSecurityCADispatch {
-    /// `security.ca_install` {pem}: install the PEM anchor into the admin trust
-    /// store, reply `{sha256, subject}`.
+    /// `security.ca_install` {pem, admin?}: install the PEM anchor into the
+    /// selected trust domain (`admin: true` ⇒ admin, else user), reply
+    /// `{sha256, subject, domain}`.
     static func install(_ params: [String: Any],
                         resolveSPI: GuestTrustStore.SPIProvider = GuestTrustStore.liveSPI) throws -> [String: Any] {
-        let anchor = try GuestTrustStore.install(pem: requiredString(params, "pem"), resolveSPI: resolveSPI)
-        return ["sha256": GuestTrustStore.hexString(anchor.sha256),
-                "subject": GuestTrustStore.subjectSummary(fromCertificateDER: anchor.der)]
+        let result = try GuestTrustStore.install(pem: requiredString(params, "pem"),
+                                                 admin: optionalBool(params, "admin"),
+                                                 resolveSPI: resolveSPI)
+        return ["sha256": GuestTrustStore.hexString(result.anchor.sha256),
+                "subject": GuestTrustStore.subjectSummary(fromCertificateDER: result.anchor.der),
+                "domain": result.domain.name]
     }
 
     /// `security.ca_remove` {sha256}: remove the anchor with that digest, reply
@@ -42,5 +46,20 @@ enum GuestSecurityCADispatch {
             throw GuestAPIError.invalidRequest("\(key) is required", hint: "Pass \(key) as a non-empty string")
         }
         return value
+    }
+
+    /// An optional Bool param: absent ⇒ false; present-but-not-Bool ⇒
+    /// `invalidRequest`. `JSONSerialization` decodes both JSON booleans and JSON
+    /// numbers to `NSNumber`, and `NSNumber as? Bool` bridges `1`/`0` just like
+    /// `true`/`false`, so a numeric `admin` would be silently accepted. Match the
+    /// underlying CFBoolean type instead: only a true JSON boolean passes; a
+    /// number (`1`), string, or any other type is rejected so a mistyped `admin`
+    /// is never honoured.
+    private static func optionalBool(_ params: [String: Any], _ key: String) throws -> Bool {
+        guard let raw = params[key] else { return false }
+        guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            throw GuestAPIError.invalidRequest("\(key) must be a boolean", hint: "Pass \(key) as true or false")
+        }
+        return number.boolValue
     }
 }

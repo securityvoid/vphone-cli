@@ -5,7 +5,7 @@ import CryptoKit
 // MARK: - Harness
 
 /// Host-runnable checks of the guest-independent GuestTrustStore logic: the
-/// admin-domain install/remove/list flow driven through injected
+/// user/admin-domain install/remove/list flow driven through injected
 /// `GuestTrustStore.SPI` fakes (no live trustd), covering the all-or-none
 /// install flow and its rollback, the SPI-failure / malformed-CopyAll /
 /// SPI-unavailable / NULL-store paths, the serial-queue serialization, the
@@ -63,6 +63,8 @@ func caughtCode(_ body: () throws -> Void) -> String? {
 final class FakeSPI: @unchecked Sendable {
     var store: [Data]
     var calls: [String] = []
+    /// The `SecTrustStoreDomain` code of each `forDomain` call (2 user, 3 admin).
+    var domainCodes: [Int32] = []
 
     var forDomainReturnsNull = false
     let handle = OpaquePointer(bitPattern: 0x1)!
@@ -102,8 +104,9 @@ final class FakeSPI: @unchecked Sendable {
 
     func spi() -> GuestTrustStore.SPI {
         GuestTrustStore.SPI(
-            forDomain: { _ in
+            forDomain: { code in
                 self.calls.append("forDomain")
+                self.domainCodes.append(code)
                 return self.forDomainReturnsNull ? nil : self.handle
             },
             set: { _, cert in
@@ -218,16 +221,47 @@ enum TrustStoreTests {
         let certPEM = pem(fromDER: der)
         let hex = GuestTrustStore.hexString(sha256)
 
-        // install {pem} ⇒ {sha256, subject}, and nothing else.
+        // install {pem} ⇒ {sha256, subject, domain:"user"} (missing admin ⇒ user), nothing else.
         do {
             let fake = FakeSPI()
             let reply = try? GuestSecurityCADispatch.install(["pem": certPEM], resolveSPI: fake.spi)
             expectEqual(reply?["sha256"] as? String, hex, "ca_install reply sha256 is the DER digest hex")
             expectEqual(reply?["subject"] as? String, "Test CA", "ca_install reply subject is the summary")
-            expectEqual(reply?.keys.sorted(), ["sha256", "subject"], "ca_install reply has only sha256,subject (no domains)")
+            expectEqual(reply?["domain"] as? String, "user", "ca_install with no admin param defaults to domain user")
+            expectEqual(reply?.keys.sorted(), ["domain", "sha256", "subject"], "ca_install reply has exactly sha256,subject,domain")
             expect(fake.store.contains(der), "ca_install wires through to the trust-store install")
         }
-
+        // admin travels the real JSON wire: decode each `admin` value through
+        // JSONSerialization so the param dict matches what the daemon receives
+        // (NSNumber/CFBoolean bridging is real, not native Swift literals).
+        func jsonValue(_ literal: String) -> Any {
+            let object = try! JSONSerialization.jsonObject(with: Data("{\"v\":\(literal)}".utf8)) as! [String: Any]
+            return object["v"]!
+        }
+        // A real JSON boolean selects the domain; true ⇒ admin, false ⇒ user.
+        // Domain *codes* are proven at the GuestTrustStore layer; here only the
+        // reply domain-name wiring is asserted.
+        // MUTATION: ignore `admin` in the dispatch ⇒ the admin install reports user.
+        do {
+            let fake = FakeSPI()
+            let reply = try? GuestSecurityCADispatch.install(["pem": certPEM, "admin": jsonValue("true")], resolveSPI: fake.spi)
+            expectEqual(reply?["domain"] as? String, "admin", "ca_install admin:true (JSON bool) reports domain admin")
+            expect(fake.store.contains(der), "ca_install admin:true wires through to the trust-store install")
+            let off = FakeSPI()
+            let offReply = try? GuestSecurityCADispatch.install(["pem": certPEM, "admin": jsonValue("false")], resolveSPI: off.spi)
+            expectEqual(offReply?["domain"] as? String, "user", "ca_install admin:false (JSON bool) reports domain user")
+        }
+        // A present non-boolean admin ⇒ invalidRequest naming admin, no SPI call.
+        // JSON 1 and 0 both bridge to Swift Bool today but MUST now be rejected;
+        // a JSON string is rejected too.
+        for bad in [jsonValue("1"), jsonValue("0"), jsonValue("\"true\"")] {
+            let fake = FakeSPI()
+            let code = caughtCode { _ = try GuestSecurityCADispatch.install(["pem": certPEM, "admin": bad], resolveSPI: fake.spi) }
+            let message = caughtMessage { _ = try GuestSecurityCADispatch.install(["pem": certPEM, "admin": bad], resolveSPI: fake.spi) }
+            expectEqual(code, "invalid_param", "JSON non-boolean admin \(bad) is invalidRequest")
+            expect(message?.contains("admin must be a boolean") == true, "non-boolean admin names admin, got \(String(describing: message))")
+            expect(fake.calls.isEmpty && fake.store.isEmpty, "non-boolean admin makes no SPI call, calls=\(fake.calls)")
+        }
         // install with a missing or empty pem ⇒ invalidRequest naming pem, no SPI call.
         // MUTATION: change the install arm's key from "pem" ⇒ this rejects a valid call.
         for bad in [[:] as [String: Any], ["pem": ""], ["pem": 7]] {
@@ -282,7 +316,7 @@ enum TrustStoreTests {
         do {
             let fake = FakeSPI()
             let anchor = try? GuestTrustStore.install(pem: certPEM, resolveSPI: fake.spi)
-            expect(anchor?.sha256 == sha256, "install returns the anchor with the DER's sha256")
+            expect(anchor?.anchor.sha256 == sha256, "install returns the anchor with the DER's sha256")
             expect(fake.calls.contains("set"), "install calls SecTrustStoreSetTrustSettings")
             let listed = try? GuestTrustStore.list(resolveSPI: fake.spi)
             expect(listed?.count == 1 && listed?.first?.sha256 == sha256, "list shows the installed anchor")
@@ -296,7 +330,7 @@ enum TrustStoreTests {
         do {
             let fake = FakeSPI(store: [der])
             let anchor = try? GuestTrustStore.install(pem: certPEM, resolveSPI: fake.spi)
-            expect(anchor?.sha256 == sha256, "idempotent re-install of a pre-present cert succeeds")
+            expect(anchor?.anchor.sha256 == sha256, "idempotent re-install of a pre-present cert succeeds")
         }
 
         // (a) post-write verify failure: set returns success but CopyAll omits
@@ -310,10 +344,29 @@ enum TrustStoreTests {
             let message = caughtMessage { _ = try GuestTrustStore.install(pem: certPEM, resolveSPI: fake.spi) }
             expect(message?.contains("SecTrustStoreSetTrustSettings") == true
                 && message?.contains("SecTrustStoreCopyAll") == true
-                && message?.contains("not present in the admin trust store after the write") == true,
+                && message?.contains("not present in the user trust store after the write") == true,
                 "(a) cert-absent install names both SPIs and the not-present cause, got \(String(describing: message))")
             expect(fake.calls.contains("remove"), "(a) a not-pre-present failed install rolls back with remove")
             expect(fake.store.isEmpty, "(a) rollback leaves nothing installed")
+        }
+
+        // (a-admin) admin-domain post-write verify failure + rollback (V2-r1-3):
+        // install with admin:true where the post-write CopyAll omits the just-
+        // written cert ⇒ install throws, the error names the ADMIN trust store
+        // (not user), and the compensating SecTrustStoreRemoveCertificate runs
+        // against the admin domain (code 3). Mirrors (a) for the admin domain.
+        do {
+            let fake = FakeSPI()
+            fake.setApplies = false
+            let message = caughtMessage { _ = try GuestTrustStore.install(pem: certPEM, admin: true, resolveSPI: fake.spi) }
+            expect(message?.contains("not present in the admin trust store after the write") == true,
+                "(a-admin) admin post-write-failure names the admin trust store, got \(String(describing: message))")
+            expect(message?.contains("user trust store") != true,
+                "(a-admin) the error names the admin, not the user, trust store, got \(String(describing: message))")
+            expect(fake.calls.contains("remove"), "(a-admin) a not-pre-present failed admin install rolls back with remove")
+            expect(!fake.domainCodes.isEmpty && fake.domainCodes.allSatisfy { $0 == 3 },
+                "(a-admin) the compensating remove runs against the admin domain (code 3), codes=\(fake.domainCodes)")
+            expect(fake.store.isEmpty, "(a-admin) admin rollback leaves nothing installed")
         }
 
         // (b0) write failed but cert landed, not pre-present ⇒ remove is called
@@ -604,6 +657,82 @@ enum TrustStoreTests {
             expect(fake.calls.contains("set") && fake.calls.contains("remove"),
                    "post-write non-zero CopyAll rolls back, calls=\(fake.calls)")
             expect(fake.store.isEmpty, "post-write non-zero CopyAll leaves nothing installed")
+        }
+
+        // Domain selection: user ⇒ code 2, admin ⇒ code 3 for install; remove/list use admin (3).
+        do {
+            let user = FakeSPI()
+            let userResult = try? GuestTrustStore.install(pem: certPEM, resolveSPI: user.spi)
+            expectEqual(userResult?.domain.name, "user", "install defaults to the user domain")
+            expectEqual(user.domainCodes, [2], "user install opens only the user store")
+            let admin = FakeSPI()
+            let adminResult = try? GuestTrustStore.install(pem: certPEM, admin: true, resolveSPI: admin.spi)
+            expectEqual(adminResult?.domain.name, "admin", "install admin:true reports the admin domain")
+            expectEqual(admin.domainCodes, [3], "admin install opens only the admin store")
+            // Single trustd: a user-domain write is visible to the admin-handle list and removable by remove.
+            let shared = FakeSPI()
+            _ = try? GuestTrustStore.install(pem: certPEM, resolveSPI: shared.spi)
+            expectEqual((try? GuestTrustStore.list(resolveSPI: shared.spi))?.count, 1, "a user-domain install is listed via the admin handle")
+            _ = try? GuestTrustStore.removeAnchor(sha256Hex: hex, resolveSPI: shared.spi)
+            expect(shared.store.isEmpty, "a user-domain install is removable via remove")
+        }
+
+        // errSecParam (-50) from CopyAll is an EMPTY store, not an error.
+        // Pre-write -50 ⇒ install proceeds to set.
+        do {
+            let fake = FakeSPI()
+            fake.copyAllOverride = { index, store in
+                index == 0 ? (errSecParam, nil) : (errSecSuccess, FakeSPI.contents(from: store))
+            }
+            let anchor = try? GuestTrustStore.install(pem: certPEM, resolveSPI: fake.spi)
+            expect(anchor != nil && fake.calls.contains("set"), "pre-write CopyAll -50 is an empty store: install proceeds to set")
+        }
+
+        // (h) post-write CopyAll -50 ⇒ "not present after write" + rollback, NO success.
+        // MUTATION (h): treat -50 as an error (drop the errSecParam branch) ⇒ the message
+        // becomes "SecTrustStoreCopyAll failed" and this check fails; treat -50 as present ⇒
+        // install returns success and this fails.
+        do {
+            let fake = FakeSPI()
+            fake.copyAllOverride = { index, store in
+                index == 1 ? (errSecParam, nil) : (errSecSuccess, FakeSPI.contents(from: store))
+            }
+            var succeeded = false
+            let message = caughtMessage { _ = try GuestTrustStore.install(pem: certPEM, resolveSPI: fake.spi); succeeded = true }
+            expect(!succeeded, "(h) post-write CopyAll -50 never reports success")
+            expect(message?.contains("not present in the user trust store after the write") == true,
+                   "(h) post-write -50 reports not-present-after-write, got \(String(describing: message))")
+            expect(fake.calls.contains("remove") && fake.store.isEmpty, "(h) post-write -50 rolls back with RemoveCertificate, calls=\(fake.calls)")
+        }
+
+        // (i) ca_list: -50 ⇒ empty; a real non-zero status ⇒ SPI error naming SecTrustStoreCopyAll.
+        do {
+            let empty = FakeSPI()
+            empty.copyAllStatus = errSecParam
+            expectEqual((try? GuestTrustStore.list(resolveSPI: empty.spi))?.count, 0, "(i) list with CopyAll -50 is empty")
+            let real = FakeSPI()
+            real.copyAllStatus = -25300
+            let message = caughtMessage { _ = try GuestTrustStore.list(resolveSPI: real.spi) }
+            expect(message?.contains("SecTrustStoreCopyAll") == true && message?.contains("-25300") == true,
+                   "(i) list with CopyAll -25300 is an SPI error naming SecTrustStoreCopyAll, got \(String(describing: message))")
+        }
+
+        // (j) ca_remove: first-enum -50 ⇒ not-found with NO RemoveCertificate; post-remove
+        // re-check -50 ⇒ removed.
+        do {
+            let fake = FakeSPI(store: [der])
+            fake.copyAllStatus = errSecParam
+            let message = caughtMessage { _ = try GuestTrustStore.removeAnchor(sha256Hex: hex, resolveSPI: fake.spi) }
+            expect(message?.contains("No installed CA has sha256") == true, "(j) first-enum -50 is not-found, got \(String(describing: message))")
+            expect(!fake.calls.contains("remove"), "(j) first-enum -50 calls no RemoveCertificate, calls=\(fake.calls)")
+
+            let after = FakeSPI(store: [der])
+            after.copyAllOverride = { index, store in
+                index == 1 ? (errSecParam, nil) : (errSecSuccess, FakeSPI.contents(from: store))
+            }
+            let removed = try? GuestTrustStore.removeAnchor(sha256Hex: hex, resolveSPI: after.spi)
+            expectEqual(removed, hex, "(j) post-remove re-check -50 reports removed")
+            expect(after.calls.contains("remove") && after.store.isEmpty, "(j) remove was called and the store is empty")
         }
     }
 }

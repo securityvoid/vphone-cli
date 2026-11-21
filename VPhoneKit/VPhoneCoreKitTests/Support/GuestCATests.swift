@@ -9,10 +9,10 @@ import Testing
 /// rejects open no socket and raise `UsageError`; a tiny in-test Unix-socket
 /// stub (the one-line request / one-line JSON reply protocol
 /// `VPhoneHostAutomationProbe.send` speaks) drives the install/remove/list
-/// transport, reply validation, and stdout formatting. The guest installs into
-/// the admin trust domain only, so there is no `--admin` flag and no `domains`
-/// field: install/remove replies carry just `sha256` (+ `subject`/`removed`),
-/// and `ca list` renders `sha256 TAB subject`.
+/// transport, reply validation, and stdout formatting. The trust domain is
+/// operator-selectable (user by default, `admin: true` for admin): the install
+/// reply carries a required `domain` (`user`|`admin`), remove/list carry no
+/// domain, and `ca list` renders `sha256 TAB subject`.
 struct GuestCATests {
     // MARK: Helpers
 
@@ -189,7 +189,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domain": "user"]],
         )
         defer { server.stop() }
         let pemText = validPEM()
@@ -203,7 +203,24 @@ struct GuestCATests {
         let sent = try #require(params["pem"] as? String)
         #expect(sent.contains("-----BEGIN CERTIFICATE-----") && sent.contains("-----END CERTIFICATE-----"))
         #expect(sent.contains("MIIBfakebase64=="))
-        #expect(params["admin"] == nil, "no admin param is sent: the guest installs admin-domain only")
+        #expect(params["admin"] == nil, "default (user) install sends no admin key")
+        #expect(params["force"] as? Bool == true)
+    }
+
+    // MUTATION: sending `admin` unconditionally (or never) breaks one of these two tests.
+    @Test func `install with admin sends admin true`() throws {
+        let fixture = try makeLibrary()
+        let server = try StubSocketServer(
+            path: fixture.socketPath,
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domain": "admin"]],
+        )
+        defer { server.stop() }
+        let pem = try writePEM(validPEM())
+
+        try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, admin: true, rpc: controlSocketRPC)
+
+        let params = try #require(server.lastRequest()?["params"] as? [String: Any])
+        #expect(params["admin"] as? Bool == true)
         #expect(params["force"] as? Bool == true)
     }
 
@@ -211,7 +228,7 @@ struct GuestCATests {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
             path: fixture.socketPath,
-            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x", "domain": "user"]],
         )
         defer { server.stop() }
         let combined = "-----BEGIN PRIVATE KEY-----\nSECRETKEYMATERIAL==\n-----END PRIVATE KEY-----\n"
@@ -389,6 +406,24 @@ struct GuestCATests {
         }
     }
 
+    @Test func `an install reply missing domain is malformed`() throws {
+        let fixture = try makeLibrary()
+        let server = try StubSocketServer(
+            path: fixture.socketPath,
+            reply: ["ok": true, "result": ["sha256": sha256A, "subject": "x"]],
+        )
+        defer { server.stop() }
+        let pem = try writePEM(validPEM())
+        #expect {
+            try VPhoneGuestCA.install(vmName: "vm", library: fixture.library, pemPath: pem, rpc: controlSocketRPC)
+        } throws: { ($0 as? VPhoneGuestCA.RuntimeError)?.description.contains("malformed security.ca_install reply") == true }
+    }
+
+    @Test(arguments: ["user", "admin"])
+    func `an install reply with a valid domain is accepted`(domain: String) throws {
+        try VPhoneGuestCA.validateInstallReply(["sha256": sha256A, "subject": "x", "domain": domain])
+    }
+
     @Test func `a remove reply with removed not exactly true is malformed`() throws {
         let fixture = try makeLibrary()
         let server = try StubSocketServer(
@@ -404,8 +439,11 @@ struct GuestCATests {
     // MARK: Success + refusal replies
 
     @Test(arguments: [
-        #"{"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","subject":"x"}"#,
-        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":5}"#,
+        #"{"sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","subject":"x","domain":"user"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":5,"domain":"user"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":"x"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":"x","domain":"system"}"#,
+        #"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","subject":"x","domain":5}"#,
     ])
     func `an install reply with a bad field is malformed`(json: String) throws {
         let reply = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])

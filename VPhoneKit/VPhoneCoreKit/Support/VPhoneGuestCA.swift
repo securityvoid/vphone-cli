@@ -45,22 +45,26 @@ public enum VPhoneGuestCA {
 
     // MARK: - Public operations
 
-    /// `vm ca install <vmname> <pem-file>`: read + validate the PEM host-side,
-    /// extract only the single CERTIFICATE block, then
-    /// `security.ca_install {pem, force: true}` (admin trust domain). Validates
-    /// the reply. Writes nothing on success.
+    /// `vm ca install <vmname> <pem-file> [--admin]`: read + validate the PEM
+    /// host-side, extract only the single CERTIFICATE block, then
+    /// `security.ca_install {pem, force: true[, admin: true]}` — user trust
+    /// domain by default, admin when `admin` is set. Validates the reply. Writes
+    /// nothing on success.
     public static func install(
         vmName: String,
         library: VPhoneLibrary,
         pemPath: String,
+        admin: Bool = false,
         timeout: Int = timeoutSeconds,
         rpc: RPC,
     ) throws {
         let socketPath = try socketPath(vmName: vmName, library: library)
         let pem = try loadInstallPEM(path: pemPath)
+        var params: [String: Any] = ["pem": pem, "force": true]
+        if admin { params["admin"] = true }
         let reply = try call(
             method: "security.ca_install",
-            params: ["pem": pem, "force": true],
+            params: params,
             socketPath: socketPath, vmName: vmName, timeout: timeout, rpc: rpc,
             timeoutTail: "",
         )
@@ -158,13 +162,15 @@ public enum VPhoneGuestCA {
     // MARK: - Reply validation + formatting
 
     /// Validate a `security.ca_install` reply: 64-hex `sha256`, string
-    /// `subject`. Any violation is a malformed-reply error (exit 1).
+    /// `subject`, and a `domain` of `user` or `admin` (the domain the anchor
+    /// landed in). Any violation is a malformed-reply error (exit 1).
     static func validateInstallReply(_ reply: [String: Any]) throws {
         guard let sha256 = reply["sha256"] as? String, isSHA256Hex(sha256),
-              reply["subject"] is String
+              reply["subject"] is String,
+              let domain = reply["domain"] as? String, domain == "user" || domain == "admin"
         else {
             throw RuntimeError(
-                "malformed security.ca_install reply: expected {sha256: 64-hex, subject: string}",
+                "malformed security.ca_install reply: expected {sha256: 64-hex, subject: string, domain: user|admin}",
             )
         }
     }
