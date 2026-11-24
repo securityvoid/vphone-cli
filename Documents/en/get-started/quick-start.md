@@ -4,7 +4,7 @@ Set up vphone with Launchpad and boot your first virtual iPhone. Do this once yo
 
 ## Set up with Launchpad
 
-1. Download `vphone-launchpad-<version>-notarized.zip` from the [latest release](https://github.com/Lakr233/vphone-cli/releases/latest), unzip it, and open it. Not every release is notarized. If the latest one has no `-notarized` file, pick a notarized version from [Downloads](downloads.md).
+1. Download `vphone-launchpad-<version>-notarized.zip` from the [latest release](https://github.com/Lakr233/vphone-cli/releases/latest), unzip it, and open it. Not every release is notarized. If the latest one has no `-notarized` file, pick a notarized version from [Downloads](downloads.md). To install with Homebrew instead, see [Homebrew tap](homebrew-tap.md).
 2. In **Host Setup**, grant Developer Tools access and install the helper.
 3. In **Core Bundle**, click **Download and Install**.
 4. In **Machines**, click **New Machine**, choose a firmware pairing, and click **Create**.

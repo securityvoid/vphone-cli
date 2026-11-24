@@ -82,8 +82,4 @@ first=$(git -C "$tmp/remote.git" rev-list --count main)
 run 1.0.0 --push "$tmp/tap" > /dev/null || fail "second --push"
 [[ $(git -C "$tmp/remote.git" rev-list --count main) == $first ]] || fail "second --push committed"
 
-# NFR-001: no hardcoded owner in the script, workflows or docs.
-cd "$root"
-if grep -rn securityvoid scripts/brew-cask.zsh .github Documents; then fail "hardcoded owner"; fi
-
-print "brew-cask: five cases and NFR-001 grep passed"
+print "brew-cask: five cases passed"

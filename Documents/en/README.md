@@ -10,6 +10,7 @@ New to vphone? Read [Overview](get-started/overview.md), then follow [Quick Star
 | [Quick Start](get-started/quick-start.md) | Your first VM with Launchpad, or with a coding agent |
 | [Host Setup](get-started/host-setup.md) | SIP, AMFI and Research Guests settings on the Mac |
 | [Downloads](get-started/downloads.md) | Notarized Launchpad versions and matching `VPhone.bundle` versions |
+| [Homebrew tap](get-started/homebrew-tap.md) | Install Launchpad, the command line tool and the agent skills with Homebrew, and publish a tap |
 
 ## Machines
 

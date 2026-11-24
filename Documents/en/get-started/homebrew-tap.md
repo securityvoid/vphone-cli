@@ -63,3 +63,6 @@ zsh scripts/brew-cask.zsh <tag> --tap acme/tap --push homebrew-tap
 - `--push` stages the two cask files, commits `vphone <tag>` unless nothing changed, and pushes. Run it again after a rejected push to publish.
 
 The release must contain the Launchpad zip (the notarized zip is used when present) and `vphone-skills-<tag>.zip`.
+
+> [!IMPORTANT]
+> The release workflow builds an unsigned Launchpad, and macOS refuses to open it once Homebrew has downloaded it ("damaged and can't be opened"). Attach the signed and notarized zip, `vphone-launchpad-<tag>-notarized.zip`, to the release and run the script again so the cask points at it.

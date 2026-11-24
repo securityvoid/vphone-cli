@@ -47,4 +47,5 @@ vphone-cli runs iOS with Apple's Virtualization.framework and PCC research virtu
 - [Quick Start](quick-start.md)
 - [Host Setup](host-setup.md)
 - [Downloads](downloads.md)
+- [Homebrew tap](homebrew-tap.md)
 - [Create and Run a VM](../machines/create-and-run.md)

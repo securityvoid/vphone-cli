@@ -16,6 +16,7 @@ vphone-cli runs iOS with Apple's Virtualization.framework and PCC research virtu
 Everything else lives on the documentation site: **<https://lakr233.github.io/vphone-cli/>**
 
 - [Quick Start](https://lakr233.github.io/vphone-cli/get-started/quick-start): requirements, host settings, and your first VM with Launchpad.
+- [Homebrew tap](https://lakr233.github.io/vphone-cli/get-started/homebrew-tap): install Launchpad, `vphone-launchpad-cli` and the agent skills with Homebrew, and set up a tap to publish them.
 - [Manual](https://lakr233.github.io/vphone-cli/get-started/overview): machines, firmware, storage, networking, and troubleshooting, in English, 中文, 日本語 and 한국어.
 - [Research Notes](https://lakr233.github.io/vphone-cli/research/): patches, boot chain, restore, and the automation API reference.
 
