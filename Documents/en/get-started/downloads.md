@@ -12,6 +12,8 @@ Each [release](https://github.com/Lakr233/vphone-cli/releases) has up to three f
 | `vphone-launchpad-<version>.zip` | Launchpad, not notarized. macOS blocks it the first time you open it. |
 | `VPhone-<version>.zip` | `VPhone.bundle`. Launchpad downloads and installs it for you, so you do not need this file. |
 
+To install Launchpad, `vphone-launchpad-cli` and the agent skills with Homebrew instead, see [Homebrew tap](homebrew-tap.md).
+
 To open a version that is not notarized, open it once, then go to **System Settings > Privacy & Security** and click **Open Anyway**.
 
 ## Notarized Launchpad versions

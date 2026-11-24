@@ -1,0 +1,27 @@
+cask "vphone-launchpad" do
+  version "1.0.0"
+  sha256 "a584e1b352cc659f2502133076d04686dd19c40a603d08a5a22ae1bb3f475c03"
+
+  url "https://github.com/octo/vphone/releases/download/#{version}/vphone-launchpad-#{version}-notarized.zip"
+  name "vphone-launchpad"
+  desc "Launchpad for the vphone virtual iPhone"
+  homepage "https://github.com/octo/vphone"
+
+  depends_on arch: :arm64
+  depends_on macos: :sequoia
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on cask: "acme/tap/vphone-skills"
+
+  app "vphone-launchpad.app"
+  binary "#{appdir}/vphone-launchpad.app/Contents/MacOS/vphone-launchpad-cli"
+
+  caveats <<~EOS
+    Open Launchpad once to complete Host Setup, then run:
+      vphone-launchpad-cli bundle install-release #{version}
+  EOS
+end
