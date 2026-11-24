@@ -54,14 +54,18 @@ run 1.0.0 --out "$out" > "$tmp/stdout" || fail "render 1.0.0"
 diff "$fx/expected/notarized-launchpad.rb" "$out/Casks/vphone-launchpad.rb" || fail "launchpad cask differs"
 diff "$fx/expected/skills-1.0.0.rb" "$out/Casks/vphone-skills.rb" || fail "skills cask differs"
 
-# 2. Plain zip is used when the notarized asset is absent (404).
+# 2. A release with only the unsigned zip is not published: exit 3, no output.
 out="$tmp/o2"
-run 1.0.1 --out "$out" > /dev/null || fail "render 1.0.1"
-diff "$fx/expected/plain-launchpad.rb" "$out/Casks/vphone-launchpad.rb" || fail "plain launchpad cask differs"
+rc=0
+run 1.0.1 --out "$out" > "$tmp/stdout2" 2> /dev/null || rc=$?
+[[ $rc -eq 3 ]] || fail "unsigned release exit $rc, expected 3"
+[[ ! -s $tmp/stdout2 && ! -e $out/Casks ]] || fail "unsigned release left output"
 
-# 3. A missing asset fails, prints nothing and writes nothing.
+# 3. A missing skills asset fails (exit 1), prints nothing and writes nothing.
 out="$tmp/o3"
-if run 1.0.2 --out "$out" > "$tmp/stdout3" 2>/dev/null; then fail "missing asset succeeded"; fi
+rc=0
+run 1.0.2 --out "$out" > "$tmp/stdout3" 2> /dev/null || rc=$?
+[[ $rc -eq 1 ]] || fail "missing skills exit $rc, expected 1"
 [[ ! -s $tmp/stdout3 && ! -e $out/Casks ]] || fail "missing asset left output"
 
 # 4. A 5xx is not treated as absent.

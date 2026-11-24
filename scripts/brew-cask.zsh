@@ -1,6 +1,8 @@
 #!/bin/zsh
 # Render the Homebrew casks for a release tag, optionally committing and
-# pushing them to a tap checkout. Uses only public release assets.
+# pushing them to a tap checkout. Uses only public release assets. Publishes
+# only signed releases: exits 3 and writes nothing when the notarized
+# Launchpad zip is not attached yet.
 set -uo pipefail
 
 usage() {
@@ -54,30 +56,24 @@ fetch() {
   shasum -a 256 "$work/$1" | awk '{print $1}'
 }
 
-launchpad="vphone-launchpad-$tag.zip"
 notarized="vphone-launchpad-$tag-notarized.zip"
 skills_zip="vphone-skills-$tag.zip"
 
-code=$(status "$notarized") || die "probe failed: $notarized"
-case $code in
-  200) launchpad_asset=$notarized ;;
-  404) launchpad_asset=$launchpad ;;
-  *) die "unexpected HTTP $code for $notarized" ;;
-esac
-# require <asset>: succeeds only when the asset answers 200.
+# require <asset> [<exit code for a missing asset>]: succeeds only when the
+# asset answers 200. Exit 3 means the release is not signed yet.
 require() {
   local code
   code=$(status "$1") || die "probe failed: $1"
   case $code in
     200) ;;
-    404) die "release $tag has no asset: $1" ;;
+    404) die "release $tag has no asset: $1" "${2:-1}" ;;
     *) die "unexpected HTTP $code for $1" ;;
   esac
 }
-require "$launchpad_asset"
+require "$notarized" 3
 require "$skills_zip"
 
-launchpad_sha=$(fetch "$launchpad_asset") || exit 1
+launchpad_sha=$(fetch "$notarized") || exit 1
 skills_sha=$(fetch "$skills_zip") || exit 1
 [[ -n $launchpad_sha && -n $skills_sha ]] || die "sha256 failed"
 
@@ -99,7 +95,7 @@ cask "vphone-launchpad" do
   version "$tag"
   sha256 "$launchpad_sha"
 
-  url "$url_base/${launchpad_asset//$tag/$ver}"
+  url "$url_base/vphone-launchpad-$ver-notarized.zip"
   name "vphone-launchpad"
   desc "Launchpad for the vphone virtual iPhone"
   homepage "https://github.com/$repo"

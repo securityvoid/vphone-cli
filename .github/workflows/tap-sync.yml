@@ -1,11 +1,11 @@
 name: tap-sync
 
-# Opt-in: republishes the Homebrew casks for the latest release to the tap
-# repository named by the TAP_REPO variable. The notarized Launchpad zip is
-# attached by hand after the release workflow has finished, so the casks the
-# release workflow wrote point at the unsigned zip until this runs again. The
-# script changes nothing when the casks are already current. Run it by hand
-# from the Actions tab to publish sooner.
+# Opt-in: publishes the Homebrew casks for the latest release to the tap
+# repository named by the TAP_REPO variable, once that release is signed. The
+# notarized Launchpad zip is attached by hand after the release workflow has
+# finished, so a release is skipped until the zip exists. The script changes
+# nothing when the casks are already current. Run it by hand from the Actions
+# tab to publish sooner.
 
 on:
   schedule:
@@ -49,4 +49,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)}"
-          zsh scripts/brew-cask.zsh "$tag" --push tap
+          rc=0
+          zsh scripts/brew-cask.zsh "$tag" --push tap || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::notice::Release $tag has no notarized Launchpad zip yet; nothing published."
+            exit 0
+          fi
+          exit "$rc"

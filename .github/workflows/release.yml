@@ -174,33 +174,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: gh release upload "$TAG" "vphone-skills-${TAG}.zip" --clobber
-
-  # Opt-in: publishes the Homebrew casks to the tap repository named by the
-  # TAP_REPO variable. The TAP_TOKEN secret reaches only the tap checkout.
-  tap:
-    if: vars.TAP_REPO != ''
-    needs: [build, launchpad, skills]
-    concurrency:
-      group: tap
-      cancel-in-progress: false
-    runs-on: xcode-27
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
-
-      - name: Checkout tap
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.TAP_REPO }}
-          token: ${{ secrets.TAP_TOKEN }}
-          path: tap
-
-      - name: Publish casks
-        env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          TAP_REPO: ${{ vars.TAP_REPO }}
-          VPHONE_REPO: ${{ github.repository }}
-        run: zsh scripts/brew-cask.zsh "$TAG" --push tap
