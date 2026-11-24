@@ -35,7 +35,7 @@ brew upgrade --cask <owner>/<tap>/vphone-launchpad
 brew uninstall --cask <owner>/<tap>/vphone-launchpad
 ```
 
-Uninstalling removes the app, the command and the skill links. To remove the skills cask too, run `brew uninstall --cask <owner>/<tap>/vphone-skills`.
+Uninstalling removes the app and the command. The skills stay installed; to remove the skill links too, run `brew uninstall --cask <owner>/<tap>/vphone-skills`.
 
 ## Run your own tap
 
