@@ -113,6 +113,13 @@ $(livecheck_block)
   app "vphone-launchpad.app"
   binary "#{appdir}/vphone-launchpad.app/Contents/MacOS/vphone-launchpad-cli"
 
+  uninstall_postflight_steps do
+    run "/bin/echo", print_stdout: true, args: [
+      "To also remove the vphone agent skills:",
+      "brew uninstall --cask $tap/vphone-skills",
+    ]
+  end
+
   caveats <<~EOS
     Open Launchpad once to complete Host Setup, then run:
       vphone-launchpad-cli bundle install-release #{version}
