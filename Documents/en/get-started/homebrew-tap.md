@@ -1,15 +1,13 @@
 # Homebrew tap
 
-Install Launchpad, the `vphone-launchpad-cli` command and the repository's agent skills with one `brew install --cask` from a Homebrew tap.
+Install Launchpad, the `vphone-launchpad-cli` command and the repository's agent skills with one `brew install --cask` from the `Lakr233/tap` Homebrew tap.
 
 ## Install
 
-Replace `<owner>/<tap>` with the tap name the maintainer gives you, for example `acme/tap` for the repository `acme/homebrew-tap`.
-
 ```sh
-brew tap <owner>/<tap>
-brew trust <owner>/<tap>
-brew install --cask <owner>/<tap>/vphone-launchpad
+brew tap Lakr233/tap
+brew trust Lakr233/tap
+brew install --cask Lakr233/tap/vphone-launchpad
 ```
 
 Homebrew refuses to load casks from a tap you have not trusted, and Launchpad depends on the skills cask, so `brew trust` is required.
@@ -26,39 +24,37 @@ Then open Launchpad once for Host Setup and install the matching `VPhone.bundle`
 vphone-launchpad-cli bundle install-release <version>
 ```
 
-`<version>` is the version of the Launchpad you installed. `brew info --cask <owner>/<tap>/vphone-launchpad` prints this command with the version filled in.
+`<version>` is the version of the Launchpad you installed. `brew info --cask Lakr233/tap/vphone-launchpad` prints this command with the version filled in.
 
 Upgrade and uninstall:
 
 ```sh
-brew upgrade --cask <owner>/<tap>/vphone-launchpad
-brew uninstall --cask <owner>/<tap>/vphone-launchpad
+brew upgrade --cask Lakr233/tap/vphone-launchpad
+brew uninstall --cask Lakr233/tap/vphone-launchpad
 ```
 
-Uninstalling removes the app and the command. The skills stay installed; to remove the skill links too, run `brew uninstall --cask <owner>/<tap>/vphone-skills`.
+Uninstalling removes the app and the command. The skills stay installed; to remove the skill links too, run `brew uninstall --cask Lakr233/tap/vphone-skills`.
 
-## Run your own tap
+## Set up the tap (maintainers)
 
-A release can publish the casks to a tap repository you own. Publishing is off until you set `TAP_REPO`.
+The tap is the repository `Lakr233/homebrew-tap`. Until it exists and a release has published to it, the commands above fail. Publishing is off until you set `TAP_REPO`.
 
-1. Create a public GitHub repository named `homebrew-<name>`, for example `acme/homebrew-tap`, with a `main` branch (add a README so it is not empty).
+1. Create a public repository `Lakr233/homebrew-tap` with a `main` branch (add a README so it is not empty).
 2. Create a fine-grained personal access token. Limit it to that one repository and give it **Contents: Read and write** only.
-3. In the fork or upstream repository settings, add a repository variable `TAP_REPO` with the tap repository (`acme/homebrew-tap`) and a repository secret `TAP_TOKEN` with the token.
+3. In the `Lakr233/vphone-cli` settings under **Secrets and variables > Actions**, add the repository variable `TAP_REPO` with the value `Lakr233/homebrew-tap` and the repository secret `TAP_TOKEN` with the token.
 4. Publish a release. After the Launchpad and skills assets are uploaded, the `tap` job writes `Casks/vphone-launchpad.rb` and `Casks/vphone-skills.rb` into the tap repository in one commit.
 
 With `TAP_REPO` unset the `tap` job is skipped and the rest of the release workflow is unchanged.
 
-### Publish an existing release
-
-Check out the tap repository and run the script for a release tag. It needs only `curl` and `shasum`, and reads public release assets.
+To publish a release that already exists, for example the first one after creating the tap, check out the tap repository and run the script. It needs only `curl` and `shasum`, and reads public release assets.
 
 ```sh
-git clone https://github.com/acme/homebrew-tap
-zsh scripts/brew-cask.zsh <tag> --tap acme/tap --push homebrew-tap
+git clone https://github.com/Lakr233/homebrew-tap
+zsh scripts/brew-cask.zsh <tag> --tap Lakr233/tap --push homebrew-tap
 ```
 
-- `--repo <owner/name>` takes the assets from another repository (default: `VPHONE_REPO`, else `Lakr233/vphone-cli`).
-- `--tap` is the tap name, `acme/tap` for the repository `acme/homebrew-tap`. It defaults to `TAP_REPO`.
+- `--tap` is the tap name, `Lakr233/tap` for the repository `Lakr233/homebrew-tap`. It defaults to `TAP_REPO`.
+- `--repo <owner/name>` takes the assets from another repository (default: `VPHONE_REPO`, else `Lakr233/vphone-cli`). Use it with your own `--tap` to publish a fork.
 - Without `--push`, add `--out <dir>` to write the casks to a directory (default `.build/brew`) and review them first.
 - `--push` stages the two cask files, commits `vphone <tag>` unless nothing changed, and pushes. Run it again after a rejected push to publish.
 
