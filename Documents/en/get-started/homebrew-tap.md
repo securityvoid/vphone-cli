@@ -44,7 +44,7 @@ The tap is the repository `Lakr233/homebrew-tap`. Until it exists and a release 
 3. In the `Lakr233/vphone-cli` settings under **Secrets and variables > Actions**, add the repository variable `TAP_REPO` with the value `Lakr233/homebrew-tap` and the repository secret `TAP_TOKEN` with the token.
 4. Publish a release. After the Launchpad and skills assets are uploaded, the `tap` job writes `Casks/vphone-launchpad.rb` and `Casks/vphone-skills.rb` into the tap repository in one commit.
 
-With `TAP_REPO` unset the `tap` job is skipped and the rest of the release workflow is unchanged.
+With `TAP_REPO` unset the `tap` job and the `tap-sync` workflow are skipped and the rest of the release workflow is unchanged.
 
 To publish a release that already exists, for example the first one after creating the tap, check out the tap repository and run the script. It needs only `curl` and `shasum`, and reads public release assets.
 
@@ -61,4 +61,4 @@ zsh scripts/brew-cask.zsh <tag> --tap Lakr233/tap --push homebrew-tap
 The release must contain the Launchpad zip (the notarized zip is used when present) and `vphone-skills-<tag>.zip`.
 
 > [!IMPORTANT]
-> The release workflow builds an unsigned Launchpad, and macOS refuses to open it once Homebrew has downloaded it ("damaged and can't be opened"). Attach the signed and notarized zip, `vphone-launchpad-<tag>-notarized.zip`, to the release and run the script again so the cask points at it.
+> The release workflow builds an unsigned Launchpad, and macOS refuses to open it once Homebrew has downloaded it ("damaged and can't be opened"). Attach the signed and notarized zip, `vphone-launchpad-<tag>-notarized.zip`, to the release. The `tap-sync` workflow runs twice a day and republishes the latest release, so the cask switches to the notarized zip on its next run. To publish sooner, run **tap-sync** from the repository's **Actions** tab, or run the script above.

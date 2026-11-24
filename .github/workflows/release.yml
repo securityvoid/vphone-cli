@@ -180,6 +180,9 @@ jobs:
   tap:
     if: vars.TAP_REPO != ''
     needs: [build, launchpad, skills]
+    concurrency:
+      group: tap
+      cancel-in-progress: false
     runs-on: xcode-27
     timeout-minutes: 15
     steps:
