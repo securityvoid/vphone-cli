@@ -7,15 +7,14 @@ cask "vphone-launchpad" do
   desc "Launchpad for the vphone virtual iPhone"
   homepage "https://github.com/octo/vphone"
 
-  depends_on arch: :arm64
-  depends_on macos: :sequoia
-
   livecheck do
     url :url
     strategy :github_latest
   end
 
+  depends_on arch: :arm64
   depends_on cask: "acme/tap/vphone-skills"
+  depends_on macos: :sequoia
 
   app "vphone-launchpad.app"
   binary "#{appdir}/vphone-launchpad.app/Contents/MacOS/vphone-launchpad-cli"

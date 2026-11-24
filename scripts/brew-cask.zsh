@@ -84,11 +84,8 @@ skills_sha=$(fetch "$skills_zip") || exit 1
 ver='#{version}'
 url_base="https://github.com/$repo/releases/download/$ver"
 
-common() {
+livecheck_block() {
   cat <<EOF
-  depends_on arch: :arm64
-  depends_on macos: :sequoia
-
   livecheck do
     url :url
     strategy :github_latest
@@ -107,9 +104,11 @@ cask "vphone-launchpad" do
   desc "Launchpad for the vphone virtual iPhone"
   homepage "https://github.com/$repo"
 
-$(common)
+$(livecheck_block)
 
+  depends_on arch: :arm64
   depends_on cask: "$tap/vphone-skills"
+  depends_on macos: :sequoia
 
   app "vphone-launchpad.app"
   binary "#{appdir}/vphone-launchpad.app/Contents/MacOS/vphone-launchpad-cli"
@@ -133,7 +132,10 @@ cask "vphone-skills" do
   desc "Agent skills for vphone"
   homepage "https://github.com/$repo"
 
-$(common)
+$(livecheck_block)
+
+  depends_on arch: :arm64
+  depends_on macos: :sequoia
 
 EOF
   local s d
